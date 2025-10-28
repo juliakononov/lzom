@@ -22,6 +22,13 @@ struct lzom_module_g {
 struct lzom_req {
     struct bio *original_bio;
     struct bio *new_bio;
+    struct lzom_buffer *buffer;
+};
+
+struct lzom_buffer {
+    // u32 data_sz;
+    u32 buf_sz;
+    char *data;
 };
 
 #endif  //LZOM

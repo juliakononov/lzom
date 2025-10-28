@@ -3,7 +3,10 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/blkdev.h>
+#include <linux/bvec.h>
 #include <linux/blk_types.h>
+#include <linux/vmalloc.h>
+#include <linux/highmem.h>
 
 #include "lzom.h"
 
@@ -25,12 +28,109 @@ static bool lzom_is_exist(void)
 }
 
 /* ----------------- submit bio -----------------*/
+static unsigned short lzom_bio_size_to_pages(size_t size)
+{
+    size_t pages_needed = DIV_ROUND_UP(size, PAGE_SIZE);
+
+    return (unsigned short)min_t(size_t, pages_needed, BIO_MAX_VECS);
+}
+
+static void lzom_buffer_free(struct lzom_buffer *buf)
+{
+    if (buf)
+    {
+        kfree(buf->data);
+        kfree(buf);
+    }
+}
+
+static struct lzom_buffer *lzom_buffer_alloc(size_t size)
+{
+    struct lzom_buffer *buf;
+
+    buf = kzalloc(sizeof(*buf), GFP_NOIO);
+    if (!buf)
+    {
+        LZOM_ERRLOG("failed to allocate buffer structure");
+        return NULL;
+    }
+
+    buf->data = kzalloc(size, GFP_NOIO);
+    if (!buf->data) {
+        LZOM_ERRLOG("failed to allocate buffer data");
+        kfree(buf);
+        return NULL;
+    }
+    
+    buf->buf_sz = size;
+    return buf;
+}
+
+static int lzom_copy_from_bio_to_buf(struct bio *bio, struct lzom_buffer *buf)
+{
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    size_t copied = 0;
+
+    if (!buf || !buf->data)
+        return -EINVAL;
+
+    if (buf->buf_sz < bio->bi_iter.bi_size)
+        return -EINVAL;
+
+    bio_for_each_segment(bvec, bio, iter)
+    {
+        void *src = kmap_atomic(bvec.bv_page);
+
+        memcpy(buf->data + copied, src + bvec.bv_offset, bvec.bv_len);
+        kunmap_atomic(src);
+
+        memcpy_from_bvec(buf)
+
+        copied += bvec.bv_len;
+    }
+
+    return 0;
+}
+
+static int lzom_add_buf_to_bio(struct lzom_buffer *buf, u32 part_to_use, struct bio *bio) 
+{
+    char *data = buf->data;
+    unsigned int len = part_to_use;
+    unsigned int pageoff, pagelen;
+    int ret;
+
+    if (buf->buf_sz < part_to_use) {
+        //TODO: LZOM_ERRLOG("");
+        return -EINVAL;
+    }
+
+    pageoff = offset_in_page(data);
+
+    while (len > 0) {
+        pagelen = min_t(unsigned int, len, PAGE_SIZE - pageoff);
+
+        ret = bio_add_page(bio, virt_to_page(data), pagelen, pageoff);
+        if (ret != pagelen)
+        {
+            LZOM_ERRLOG("bio_add_page failed");
+            return -EAGAIN;
+        }
+
+        len -= pagelen;
+        data += pagelen;
+        pageoff = 0;
+    }
+
+    return 0;
+}
 
 static void lzom_req_free(struct lzom_req *lreq)
 {
     if (!lreq)
         return;
 
+    lzom_buffer_free(lreq->buffer);
     kfree(lreq);
 }
 
@@ -72,16 +172,44 @@ static void lzom_read_req_endio(struct bio *bio)
 static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *original_bio, struct lzom_dev *ldev)
 {
     struct block_device *bdev = ldev->under_dev.bdev;
-    struct bio_set *bset = ldev->under_dev.bset;
+    // struct bio_set *bset = ldev->under_dev.bset;
     struct bio *new_bio;
+    struct lzom_buffer *buf;
+    int bsize = original_bio->bi_iter.bi_size;
+    int ret;
 
-    new_bio = bio_alloc_clone(bdev, original_bio, GFP_NOIO, bset);
-    if (!new_bio) {
-        LZOM_ERRLOG("failed to clone original bio");
+    buf = lzom_buffer_alloc(bsize);
+    if (!buf)
+    {
+        LZOM_ERRLOG("failed to alloc tmp buffer");
         return BLK_STS_RESOURCE;
     }
+    lreq->buffer = buf;
 
-    // new_bio->bi_vcnt = original_bio->bi_vcnt;
+    ret = lzom_copy_from_bio_to_buf(original_bio, buf);
+    if (ret)
+    {
+        LZOM_ERRLOG("copy from bio failed: %d", ret);
+        ret = BLK_STS_IOERR;
+        goto err_out;
+    }
+
+    new_bio = bio_alloc(bdev, lzom_bio_size_to_pages(bsize), original_bio->bi_opf, GFP_NOIO);
+    if (!new_bio)
+    {
+        LZOM_ERRLOG("failed to alloc new bio");
+        ret = BLK_STS_RESOURCE;
+        goto err_out;
+    }
+
+    ret = lzom_add_buf_to_bio(buf, bsize, new_bio);
+    if (ret != 0)
+    {
+        LZOM_ERRLOG("failed to add buffer to bio");
+        ret = BLK_STS_IOERR;
+        goto err_out;
+    }
+
     new_bio->bi_end_io = lzom_write_req_endio;
     new_bio->bi_private = lreq;
     new_bio->bi_iter.bi_sector = original_bio->bi_iter.bi_sector;
@@ -90,8 +218,17 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
     lreq->new_bio = new_bio;
 
     submit_bio_noacct(new_bio);
-
     return BLK_STS_OK;
+
+err_out:
+    if (lreq->buffer)
+    {
+        lzom_buffer_free(lreq->buffer);
+        lreq->buffer = NULL;
+    }
+    if (new_bio)
+        bio_put(new_bio);
+    return ret;
 }
 
 static blk_status_t lzom_read_req_submit(struct lzom_req *lreq, struct bio *original_bio, struct lzom_dev *ldev)
