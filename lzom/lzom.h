@@ -26,7 +26,7 @@ struct lzom_req {
 };
 
 struct lzom_buffer {
-    // u32 data_sz;
+    u32 data_sz;
     u32 buf_sz;
     char *data;
 };
