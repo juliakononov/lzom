@@ -7,9 +7,9 @@
 #include <linux/blk_types.h>
 #include <linux/vmalloc.h>
 #include <linux/highmem.h>
-#include <linux/lzo.h>
 
 #include "lzom.h"
+#include "lzo_extend/lzo_extend.h"
 
 #define LZOM_NAME "lzo_module"
 #define LZOM_INIT_MINOR 0
@@ -194,7 +194,7 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
         goto err_out;
     }
 
-    dst = lzom_buffer_alloc(lzo1x_worst_compress(bsize));
+    dst = lzom_buffer_alloc(lzo_worst_compress(bsize));
     if (!dst)
     {
         LZOM_ERRLOG("failed to alloc dst buffer");
@@ -210,16 +210,16 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
     }
 
     dst_len = dst->buf_sz;
-    lzo_ret = lzo1x_1_compress(
+    lzo_ret = lzom_compress(
         (const unsigned char *)src->data,
         src->data_sz,
         (unsigned char *)dst->data,
         &dst_len,
         wrkmem);
 
-    if (lzo_ret != LZO_E_OK)
+    if (lzo_ret != LZOM_E_OK)
     {
-        LZOM_ERRLOG("lzo compress failed: %d", lzo_ret);
+        LZOM_ERRLOG("lzom compress failed: %d", lzo_ret);
         ret = BLK_STS_IOERR;
         goto err_out;
     }
@@ -237,15 +237,15 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
     }
 
     decomp_len = decomp->buf_sz;
-    lzo_ret = lzo1x_decompress_safe(
+    lzo_ret = lzom_decompress_safe(
         (const unsigned char *)dst->data,
         dst->data_sz,
         (unsigned char *)decomp->data,
         &decomp_len);
 
-    if (lzo_ret != LZO_E_OK)
+    if (lzo_ret != LZOM_E_OK)
     {
-        LZOM_ERRLOG("lzo decompress failed: %d", lzo_ret);
+        LZOM_ERRLOG("lzom decompress failed: %d", lzo_ret);
         ret = BLK_STS_IOERR;
         goto err_out;
     }
