@@ -12,6 +12,8 @@
  *  Richard Purdie <rpurdie@openedhand.com>
  */
 
+#include "lzom_sg_helpers.h"
+
 /* Version
  * 0: original lzo version
  * 1: lzo with support for RLE
@@ -27,6 +29,14 @@
 #define COPY8(dst, src) \
     COPY4(dst, src);    \
     COPY4((dst) + 4, (src) + 4)
+#endif
+
+#define LZOM_COPY4(dst_sg, src_sg) \
+    lzom_sg_copy4(dst_sg, src_sg)
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_ARM64)
+#define LZOM_COPY8(dst_sg, src_sg) \
+    lzom_sg_copy8(dst_sg, src_sg)
 #endif
 
 #if defined(__BIG_ENDIAN) && defined(__LITTLE_ENDIAN)

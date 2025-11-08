@@ -18,8 +18,11 @@
 // #include <linux/lzo.h>
 #include "lzodefs.h"
 #include "lzo_extend.h"
+#include "lzom_sg_helpers.h"
 
 #undef LZO_UNSAFE
+
+#define TODO_IMPLEMENT
 
 #ifndef LZO_SAFE
 #define LZO_UNSAFE 1
@@ -32,8 +35,10 @@
     goto output_overrun
 
 static noinline int
-LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
-                              unsigned char **out, unsigned char *op_end,
+LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
+                              size_t in_start, // Смещение начала в in
+                              size_t in_len,   // Длина обрабатываемого блока
+                              struct lzom_sg_buf *out,
                               size_t *tp, void *wrkmem,
                               signed char *state_offset,
                               const unsigned char bitstream_version)
@@ -63,7 +68,7 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
         if (unlikely(ip >= ip_end))
             break;
         dv = get_unaligned_le32(ip);
-
+#ifndef TODO_IMPLEMENT
         if (dv == 0 && bitstream_version)
         {
             const unsigned char *ir = ip + 4;
@@ -127,13 +132,15 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
                 run_length = MAX_ZERO_RUN_LENGTH;
         }
         else
-        {
+        // {
+#endif
             t = ((dv * 0x1824429d) >> (32 - D_BITS)) & D_MASK;
-            m_pos = in + dict[t];
-            dict[t] = (lzo_dict_t)(ip - in);
-            if (unlikely(dv != get_unaligned_le32(m_pos)))
-                goto literal;
-        }
+        m_pos = in + dict[t];
+        dict[t] = (lzo_dict_t)(ip - in);
+        if (unlikely(dv != get_unaligned_le32(m_pos)))
+            goto literal;
+
+        // }  TODO_IMPLEMENT
 
         ii -= ti;
         ti = 0;
@@ -148,7 +155,7 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
                 op += t;
             }
             else if (t <= 16)
-            {
+            {ii -= ti;
                 NEED_OP(17);
                 *op++ = (t - 3);
                 COPY8(op, ii);
@@ -225,6 +232,7 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
 #if defined(__LITTLE_ENDIAN)
             m_len += (unsigned)__builtin_ctzll(v) / 8;
 #elif defined(__BIG_ENDIAN)
+            BUG(); // TODO:(julia) need implement
             m_len += (unsigned)__builtin_clzll(v) / 8;
 #else
 #error "missing endian definition"
@@ -331,6 +339,7 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
                 *op++ = (M4_MARKER | ((m_off >> 11) & 8) | (m_len - 2));
             else
             {
+#ifndef TODO_IMPLEMENT
                 if (unlikely(((m_off & 0x403f) == 0x403f) && (m_len >= 261) && (m_len <= 264)) && likely(bitstream_version))
                 {
                     // Under lzo-rle, block copies
@@ -342,6 +351,7 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
                     ip -= m_len - 260;
                     m_len = 260;
                 }
+#endif // TODO_IMPLEMENT
                 m_len -= M4_MAX_LEN;
                 *op++ = (M4_MARKER | ((m_off >> 11) & 8));
                 while (unlikely(m_len > 255))
@@ -350,8 +360,6 @@ LZO_SAFE(lzo1x_1_do_compress)(const unsigned char *in, size_t in_len,
                     m_len -= 255;
                     *op++ = 0;
                 }
-                MODULE_DESCRIPTION("LZO compression block device module");
-
                 NEED_OP(1);
                 *op++ = (m_len);
             }
@@ -373,14 +381,18 @@ output_overrun:
 }
 
 static int LZO_SAFE(lzogeneric1x_1_compress)(
-    const unsigned char *in, size_t in_len,
-    unsigned char *out, size_t *out_len,
+    struct lzom_sg_buf *in,
+    struct lzom_sg_buf *out,
     void *wrkmem, const unsigned char bitstream_version)
 {
-    unsigned char *const op_end = out + *out_len;
-    const unsigned char *ip = in;
-    unsigned char *op = out;
-    unsigned char *data_start;
+    size_t in_len = in->iter.bi_size;
+
+    struct bvec_iter in_iter = in->iter;
+    struct bvec_iter out_iter = out->iter;
+
+    if (in_len == 0)
+        return LZO_E_OK;
+
     size_t l = in_len;
     size_t t = 0;
     signed char state_offset = -2;
@@ -390,116 +402,127 @@ static int LZO_SAFE(lzogeneric1x_1_compress)(
     // input), so this is used to version the bitstream
     if (bitstream_version > 0)
     {
-        *op++ = 17;
-        *op++ = bitstream_version;
+        unsigned char header[2] = {17, bitstream_version};
+        if (sg_write_bytes(out, header, 2) < 0)
+            return LZO_E_OUTPUT_OVERRUN;
         m4_max_offset = M4_MAX_OFFSET_V1;
     }
     else
     {
         m4_max_offset = M4_MAX_OFFSET_V0;
-    }
-
-    data_start = op;
+    } 
 
     while (l > 20)
     {
         size_t ll = min_t(size_t, l, m4_max_offset + 1);
-        uintptr_t ll_end = (uintptr_t)ip + ll;
+        uintptr_t ll_end = (uintptr_t)(in_len - l) + ll;
         int err;
 
         if ((ll_end + ((t + ll) >> 5)) <= ll_end)
             break;
+
         BUILD_BUG_ON(D_SIZE * sizeof(lzo_dict_t) > LZO1X_1_MEM_COMPRESS);
         memset(wrkmem, 0, D_SIZE * sizeof(lzo_dict_t));
-        err = LZO_SAFE(lzo1x_1_do_compress)(
-            ip, ll, &op, op_end, &t, wrkmem,
-            &state_offset, bitstream_version);
+
+        err = LZO_E_NOT_YET_IMPLEMENTED;
+        // LZO_SAFE(lzo1x_1_do_compress)(
+        //     ip, ll, &op, op_end, &t, wrkmem,
+        //     &state_offset, bitstream_version);
+            
         if (err != LZO_E_OK)
             return err;
-        ip += ll;
+
         l -= ll;
     }
     t += l;
 
     if (t > 0)
     {
-        const unsigned char *ii = in + in_len - t;
+        // TODO: мб есть что-то что может заменить skip bytes или 
+        // вообще это не нужно, т.к. in->iter и так на том месте
+        in->iter.bi_idx = 0;
+        in->iter.bi_bvec_done = 0;
+        in->iter.bi_size = in_len;
+        if (sg_skip_bytes(in, in_len - t) < 0)
+            return LZO_E_INPUT_OVERRUN;
+        //TODO: на подумать
 
-        if (op == data_start && t <= 238)
+        if (out_iter.bi_size == out->iter.bi_size && t <= 238)
         {
-            NEED_OP(1);
-            *op++ = (17 + t);
+            unsigned char prefix = (17 + t);
+            lzom_sg_write1(out, prefix);
         }
         else if (t <= 3)
         {
-            op[state_offset] |= t;
+            //TODO: на подумать
+    //         op[state_offset] |= t;
         }
         else if (t <= 18)
         {
-            NEED_OP(1);
-            *op++ = (t - 3);
+            unsigned char prefix = (t - 3);
+            lzom_sg_write1(out, prefix);
         }
         else
         {
             size_t tt = t - 18;
-            NEED_OP(1);
-            *op++ = 0;
+            unsigned char zero = 0;
+            lzom_sg_write1(out, zero);
+
             while (tt > 255)
             {
                 tt -= 255;
-                NEED_OP(1);
-                *op++ = 0;
+                lzom_sg_write1(out, zero);
             }
-            NEED_OP(1);
-            *op++ = tt;
+
+            unsigned char remainder = tt;
+            lzom_sg_write1(out, remainder);
         }
-        NEED_OP(t);
+
         if (t >= 16)
             do
             {
-                COPY8(op, ii);
-                COPY8(op + 8, ii + 8);
-                op += 16;
-                ii += 16;
+                LZOM_COPY8(out, in);
+                LZOM_COPY8(out, in);
                 t -= 16;
             } while (t >= 16);
         if (t > 0)
-            do
-            {
-                *op++ = *ii++;
-            } while (--t > 0);
+        {
+            unsigned char tmp[16];
+            lzom_sg_copy(out, in, tmp, t);
+        }
     }
 
-    NEED_OP(3);
-    *op++ = M4_MARKER | 1;
-    *op++ = 0;
-    *op++ = 0;
+    unsigned char eof[3] = {M4_MARKER | 1, 0, 0};
+    if (sg_write_bytes(out, eof, 3) < 0) {
+        goto output_overrun;
+    }
 
-    *out_len = op - out;
+    size_t out_len = out_iter.bi_size - out->iter.bi_size;
+    in->iter = in_iter;
+    out->iter = out_iter;
+    out->iter.bi_size = out_len;
+    
     return LZO_E_OK;
 
 output_overrun:
     return LZO_E_OUTPUT_OVERRUN;
 }
 
-int lzom_compress(const unsigned char *in, size_t in_len,
-                               unsigned char *out, size_t *out_len,
-                               void *wrkmem)
-{
+int lzom_compress(struct lzom_sg_buf *src,
+                  struct lzom_sg_buf *dst,
+                  void *wrkmem)
+{ 
     return LZO_SAFE(lzogeneric1x_1_compress)(
-        in, in_len, out, out_len, wrkmem, 0);
+        src, dst, wrkmem, 0);
 }
 
-int LZO_SAFE(lzorle1x_1_compress)(const unsigned char *in, size_t in_len,
-                                  unsigned char *out, size_t *out_len,
-                                  void *wrkmem)
+int lzom_rle_compressstruct(struct lzom_sg_buf *src,
+                            struct lzom_sg_buf *dst,
+                            void *wrkmem)
 {
     return LZO_SAFE(lzogeneric1x_1_compress)(
-        in, in_len, out, out_len, wrkmem, LZO_VERSION);
+        src, dst, wrkmem, LZO_VERSION);
 }
-
-// EXPORT_SYMBOL_GPL(LZO_SAFE(lzom_compress));
-// EXPORT_SYMBOL_GPL(LZO_SAFE(lzorle1x_1_compress));
 
 #ifndef LZO_UNSAFE
 MODULE_LICENSE("GPL");

@@ -2,6 +2,7 @@
 #define _LZO_EXTEND_H
 
 #include <linux/types.h>
+#include <linux/bvec.h>
 
 #define LZO1X_1_MEM_COMPRESS (8192 * sizeof(unsigned short))
 #define LZO1X_MEM_COMPRESS LZO1X_1_MEM_COMPRESS
@@ -23,8 +24,14 @@
 #define LZOM_E_OK LZO_E_OK
 #define LZOM_E_ERROR LZO_E_ERROR
 
-int lzom_compress(const unsigned char *in, size_t in_len,
-                  unsigned char *out, size_t *out_len,
+struct lzom_sg_buf {
+    struct bio_vec *bvec;
+    size_t num_bv;
+    struct bvec_iter iter;
+};
+
+int lzom_compress(struct lzom_sg_buf *src,
+                  struct lzom_sg_buf *dst,
                   void *wrkmem);
 
 int lzom_decompress_safe(const unsigned char *in, size_t in_len,
