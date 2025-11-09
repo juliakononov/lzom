@@ -26,12 +26,25 @@
 
 struct lzom_sg_buf {
     struct bio_vec *bvec;
-    size_t num_bv;
     struct bvec_iter iter;
 };
 
-int lzom_compress(struct lzom_sg_buf *src,
-                  struct lzom_sg_buf *dst,
+#define lzom_sg_buf_pr_info(sg_buf, fmt, ...) pr_info("bvec=%p i.bi_size=%u i.bi_idx=%u i.done=%u " fmt, \
+                                                      (sg_buf)->bvec, (sg_buf)->iter.bi_size,                \
+                                                      (sg_buf)->iter.bi_idx, (sg_buf)->iter.bi_bvec_done,    \
+                                                      ##__VA_ARGS__)
+
+#define bvec_iter_pr_info(iter, fmt, ...) pr_info("i.bi_size=%u i.bi_idx=%u i.done=%u " fmt,          \
+                                                  (iter).bi_size, (iter).bi_idx, (iter).bi_bvec_done, \
+                                                  ##__VA_ARGS__)
+
+static inline struct lzom_sg_buf lzom_sg_buf_create(struct bvec_iter iter, struct bio_vec * bvec)
+{
+    return (struct lzom_sg_buf){.iter = iter, .bvec = bvec};
+}
+
+int lzom_compress(struct lzom_sg_buf * src,
+                  struct lzom_sg_buf * dst,
                   void *wrkmem);
 
 int lzom_decompress_safe(const unsigned char *in, size_t in_len,

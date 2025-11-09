@@ -15,7 +15,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/unaligned.h>
-// #include <linux/lzo.h>
 #include "lzodefs.h"
 #include "lzo_extend.h"
 #include "lzom_sg_helpers.h"
@@ -36,38 +35,46 @@
 
 static noinline int
 LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
-                              size_t in_start, // Смещение начала в in
-                              size_t in_len,   // Длина обрабатываемого блока
+                              size_t in_len,
                               struct lzom_sg_buf *out,
                               size_t *tp, void *wrkmem,
                               signed char *state_offset,
                               const unsigned char bitstream_version)
 {
-    const unsigned char *ip;
-    unsigned char *op;
-    const unsigned char *const in_end = in + in_len;
-    const unsigned char *const ip_end = in + in_len - 20;
-    const unsigned char *ii;
+    struct bvec_iter block_start = in->iter;
+    struct bvec_iter ii_iter = in->iter;
+    size_t ip_offset = 0;
+    size_t ii_offset = 0;
+    const size_t ip_end = in_len - 20;
     lzo_dict_t *const dict = (lzo_dict_t *)wrkmem;
     size_t ti = *tp;
 
-    op = *out;
-    ip = in;
-    ii = ip;
-    ip += ti < 4 ? 4 - ti : 0;
+    if (ti < 4)
+    {
+        size_t skip = 4 - ti;
+        sg_skip_bytes(in, skip);
+        ip_offset += skip;
+    }
 
     for (;;)
     {
-        const unsigned char *m_pos = NULL;
+        size_t m_offset = 0;
         size_t t, m_len, m_off;
         u32 dv;
         u32 run_length = 0;
+
     literal:
-        ip += 1 + ((ip - ii) >> 5);
+        size_t advance = 1 + ((ip_offset - ii_offset) >> 5);
+        sg_skip_bytes(in, advance);
+        ip_offset += advance;
     next:
-        if (unlikely(ip >= ip_end))
+        if (unlikely(ip_offset >= ip_end))
             break;
-        dv = get_unaligned_le32(ip);
+
+        lzom_sg_buf_pr_info(in, "in:76\n");
+        bvec_iter_pr_info(block_start, "block_start:76 ip_offset=%lu\n", ip_offset);
+
+        dv = le32_to_cpu(lzom_sg_read4_at(in, block_start, ip_offset));
 #ifndef TODO_IMPLEMENT
         if (dv == 0 && bitstream_version)
         {
@@ -134,72 +141,90 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
         else
         // {
 #endif
-            t = ((dv * 0x1824429d) >> (32 - D_BITS)) & D_MASK;
-        m_pos = in + dict[t];
-        dict[t] = (lzo_dict_t)(ip - in);
-        if (unlikely(dv != get_unaligned_le32(m_pos)))
-            goto literal;
+        t = ((dv * 0x1824429d) >> (32 - D_BITS)) & D_MASK;
+        m_offset = dict[t];
+        dict[t] = (lzo_dict_t)ip_offset;
 
+        u32 dv_match = le32_to_cpu(lzom_sg_read4_at(in, block_start, m_offset));
+        if (unlikely(dv != dv_match))
+            goto literal;
         // }  TODO_IMPLEMENT
 
-        ii -= ti;
+        ii_offset -= ti;
         ti = 0;
-        t = ip - ii;
+        t = ip_offset - ii_offset;
+
         if (t != 0)
         {
+            struct bvec_iter saved_ip = in->iter;
+            struct bvec_iter saved_ii = ii_iter;
+            in->iter = ii_iter;
+
             if (t <= 3)
             {
-                op[*state_offset] |= t;
-                NEED_OP(4);
-                COPY4(op, ii);
-                op += t;
+                unsigned char prev_byte = lzom_sg_read_back(out, -(*state_offset));
+                prev_byte |= t;
+                lzom_sg_write_back(out, prev_byte, -(*state_offset));
+
+                unsigned char tmp[4];
+                if (lzom_sg_copy(out, in, tmp, t) < 0)
+                    goto output_overrun;
             }
             else if (t <= 16)
-            {ii -= ti;
-                NEED_OP(17);
-                *op++ = (t - 3);
-                COPY8(op, ii);
-                COPY8(op + 8, ii + 8);
-                op += t;
+            {
+                lzom_sg_write1(out, t - 3);
+
+                size_t remaining = t;
+                while (remaining >= 8)
+                {
+                    LZOM_COPY8(out, in);
+                    remaining -= 8;
+                }
+                if (remaining > 0)
+                {
+                    unsigned char tmp[8];
+                    if (lzom_sg_copy(out, in, tmp, remaining) < 0)
+                        goto output_overrun;
+                }
             }
             else
             {
                 if (t <= 18)
                 {
-                    NEED_OP(1);
-                    *op++ = (t - 3);
+                    lzom_sg_write1(out, t - 3);
                 }
                 else
                 {
                     size_t tt = t - 18;
-                    NEED_OP(1);
-                    *op++ = 0;
+                    lzom_sg_write1(out, 0);
+
                     while (unlikely(tt > 255))
                     {
                         tt -= 255;
-                        NEED_OP(1);
-                        *op++ = 0;
+                        lzom_sg_write1(out, 0);
                     }
-                    NEED_OP(1);
-                    *op++ = tt;
+
+                    lzom_sg_write1(out, (unsigned char)tt);
                 }
-                NEED_OP(t);
                 do
                 {
-                    COPY8(op, ii);
-                    COPY8(op + 8, ii + 8);
-                    op += 16;
-                    ii += 16;
+                    LZOM_COPY8(out, in);
+                    LZOM_COPY8(out, in);
                     t -= 16;
                 } while (t >= 16);
                 if (t > 0)
-                    do
-                    {
-                        *op++ = *ii++;
-                    } while (--t > 0);
+                {
+                    unsigned char tmp[16];
+                    if (lzom_sg_copy(out, in, tmp, t) < 0)
+                        goto output_overrun;
+                }
+                saved_ii = in->iter;
             }
+            ii_iter = saved_ii;
+            in->iter = saved_ip;
         }
 
+#ifndef TODO_IMPLEMENT
         if (unlikely(run_length))
         {
             ip += run_length;
@@ -211,49 +236,56 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
             *state_offset = -3;
             goto finished_writing_instruction;
         }
+#endif
 
         m_len = 4;
         {
 #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(LZO_USE_CTZ64)
-            u64 v;
-            v = get_unaligned((const u64 *)(ip + m_len)) ^
-                get_unaligned((const u64 *)(m_pos + m_len));
+            u64 v = le64_to_cpu(lzom_sg_read8_at(in, block_start, ip_offset + m_len)) ^
+                    le64_to_cpu(lzom_sg_read8_at(in, block_start, m_offset + m_len));
+
             if (unlikely(v == 0))
             {
                 do
                 {
                     m_len += 8;
-                    v = get_unaligned((const u64 *)(ip + m_len)) ^
-                        get_unaligned((const u64 *)(m_pos + m_len));
-                    if (unlikely(ip + m_len >= ip_end))
+
+                    v = le64_to_cpu(lzom_sg_read8_at(in, block_start, ip_offset + m_len)) ^
+                        le64_to_cpu(lzom_sg_read8_at(in, block_start, m_offset + m_len));
+
+                    if (unlikely(ip_offset + m_len >= ip_end))
                         goto m_len_done;
                 } while (v == 0);
             }
 #if defined(__LITTLE_ENDIAN)
             m_len += (unsigned)__builtin_ctzll(v) / 8;
 #elif defined(__BIG_ENDIAN)
-            BUG(); // TODO:(julia) need implement
             m_len += (unsigned)__builtin_clzll(v) / 8;
 #else
 #error "missing endian definition"
 #endif
 #elif defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && defined(LZO_USE_CTZ32)
-            u32 v;
-            v = get_unaligned((const u32 *)(ip + m_len)) ^
-                get_unaligned((const u32 *)(m_pos + m_len));
+            u32 v = le32_to_cpu(lzom_sg_read4_at(in, block_start, ip_offset + m_len)) ^
+                    le32_to_cpu(lzom_sg_read4_at(in, block_start, m_offset + m_len));
+
             if (unlikely(v == 0))
             {
                 do
                 {
                     m_len += 4;
-                    v = get_unaligned((const u32 *)(ip + m_len)) ^
-                        get_unaligned((const u32 *)(m_pos + m_len));
+
+                    v = le32_to_cpu(lzom_sg_read4_at(in, block_start, ip_offset + m_len)) ^
+                        le32_to_cpu(lzom_sg_read4_at(in, block_start, m_offset + m_len));
+
                     if (v != 0)
                         break;
+
                     m_len += 4;
-                    v = get_unaligned((const u32 *)(ip + m_len)) ^
-                        get_unaligned((const u32 *)(m_pos + m_len));
-                    if (unlikely(ip + m_len >= ip_end))
+
+                    v = le32_to_cpu(lzom_sg_read4_at(in, block_start, ip_offset + m_len)) ^
+                        le32_to_cpu(lzom_sg_read4_at(in, block_start, m_offset + m_len));
+
+                    if (unlikely(ip_offset + m_len >= ip_end))
                         goto m_len_done;
                 } while (v == 0);
             }
@@ -265,81 +297,94 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
 #error "missing endian definition"
 #endif
 #else
-            if (unlikely(ip[m_len] == m_pos[m_len]))
+            if (unlikely(lzom_sg_read1_at(in, block_start, ip_offset + m_len) == 
+                 lzom_sg_read1_at(in, block_start, m_offset + m_len)))
             {
                 do
                 {
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (ip[m_len] != m_pos[m_len])
+                    if (lzom_sg_read1_at(in, block_start, ip_offset + m_len) !=
+                        lzom_sg_read1_at(in, block_start, m_offset + m_len))
                         break;
+
                     m_len += 1;
-                    if (unlikely(ip + m_len >= ip_end))
+                    if (unlikely(ip_offset + m_len >= ip_end))
                         goto m_len_done;
-                } while (ip[m_len] == m_pos[m_len]);
+                } while (lzom_sg_read1_at(in, block_start, ip_offset + m_len) ==
+                         lzom_sg_read1_at(in, block_start, m_offset + m_len));
             }
 #endif
         }
     m_len_done:
+        m_off = ip_offset - m_offset;
+        ip_offset += m_len;
 
-        m_off = ip - m_pos;
-        ip += m_len;
+        in->iter = block_start;
+        sg_skip_bytes(in, ip_offset);
+
         if (m_len <= M2_MAX_LEN && m_off <= M2_MAX_OFFSET)
         {
             m_off -= 1;
-            NEED_OP(2);
-            *op++ = (((m_len - 1) << 5) | ((m_off & 7) << 2));
-            *op++ = (m_off >> 3);
+            lzom_sg_write1(out, (unsigned char)((m_len - 1) << 5) | ((m_off & 7) << 2));
+            lzom_sg_write1(out, (unsigned char)(m_off >> 3));
         }
         else if (m_off <= M3_MAX_OFFSET)
         {
             m_off -= 1;
-            NEED_OP(1);
             if (m_len <= M3_MAX_LEN)
-                *op++ = (M3_MARKER | (m_len - 2));
+                lzom_sg_write1(out, (unsigned char)(M3_MARKER | (m_len - 2)));
             else
             {
                 m_len -= M3_MAX_LEN;
-                *op++ = M3_MARKER | 0;
+                lzom_sg_write1(out, (unsigned char)(M3_MARKER | 0));
+
                 while (unlikely(m_len > 255))
                 {
                     m_len -= 255;
-                    NEED_OP(1);
-                    *op++ = 0;
+                    lzom_sg_write1(out, 0);
                 }
-                NEED_OP(1);
-                *op++ = (m_len);
+                lzom_sg_write1(out, (unsigned char)m_len);
             }
-            NEED_OP(2);
-            *op++ = (m_off << 2);
-            *op++ = (m_off >> 6);
+            lzom_sg_write1(out, (unsigned char)(m_off << 2));
+            lzom_sg_write1(out, (unsigned char)(m_off >> 6));
         }
         else
         {
             m_off -= 0x4000;
-            NEED_OP(1);
             if (m_len <= M4_MAX_LEN)
-                *op++ = (M4_MARKER | ((m_off >> 11) & 8) | (m_len - 2));
+                lzom_sg_write1(out, (unsigned char)(M4_MARKER | ((m_off >> 11) & 8) | (m_len - 2)));
             else
             {
-#ifndef TODO_IMPLEMENT
                 if (unlikely(((m_off & 0x403f) == 0x403f) && (m_len >= 261) && (m_len <= 264)) && likely(bitstream_version))
                 {
                     // Under lzo-rle, block copies
@@ -348,32 +393,33 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
                     // can result in ambiguous
                     // output. Adjust length
                     // to 260 to prevent ambiguity.
-                    ip -= m_len - 260;
+                    ip_offset -= m_len - 260;
                     m_len = 260;
+
+                    in->iter = block_start;
+                    sg_skip_bytes(in, ip_offset);
                 }
-#endif // TODO_IMPLEMENT
                 m_len -= M4_MAX_LEN;
-                *op++ = (M4_MARKER | ((m_off >> 11) & 8));
+                lzom_sg_write1(out, (unsigned char)(M4_MARKER | ((m_off >> 11) & 8)));
+
                 while (unlikely(m_len > 255))
                 {
-                    NEED_OP(1);
                     m_len -= 255;
-                    *op++ = 0;
+                    lzom_sg_write1(out, 0);
                 }
-                NEED_OP(1);
-                *op++ = (m_len);
+                lzom_sg_write1(out, (unsigned char)m_len);
             }
-            NEED_OP(2);
-            *op++ = (m_off << 2);
-            *op++ = (m_off >> 6);
+            lzom_sg_write1(out, (unsigned char)(m_off << 2));
+            lzom_sg_write1(out, (unsigned char)(m_off >> 6));
         }
         *state_offset = -2;
     finished_writing_instruction:
-        ii = ip;
+        ii_offset = ip_offset;
+        ii_iter = in->iter;
         goto next;
     }
-    *out = op;
-    *tp = in_end - (ii - ti);
+    *tp = in_len - (ii_offset - ti);
+
     return LZO_E_OK;
 
 output_overrun:
@@ -424,11 +470,9 @@ static int LZO_SAFE(lzogeneric1x_1_compress)(
         BUILD_BUG_ON(D_SIZE * sizeof(lzo_dict_t) > LZO1X_1_MEM_COMPRESS);
         memset(wrkmem, 0, D_SIZE * sizeof(lzo_dict_t));
 
-        err = LZO_E_NOT_YET_IMPLEMENTED;
-        // LZO_SAFE(lzo1x_1_do_compress)(
-        //     ip, ll, &op, op_end, &t, wrkmem,
-        //     &state_offset, bitstream_version);
-            
+        err = LZO_SAFE(lzo1x_1_do_compress)(in, ll, out, &t, wrkmem,
+                                            &state_offset, bitstream_version);
+
         if (err != LZO_E_OK)
             return err;
 
@@ -438,44 +482,32 @@ static int LZO_SAFE(lzogeneric1x_1_compress)(
 
     if (t > 0)
     {
-        // TODO: мб есть что-то что может заменить skip bytes или 
-        // вообще это не нужно, т.к. in->iter и так на том месте
-        in->iter.bi_idx = 0;
-        in->iter.bi_bvec_done = 0;
-        in->iter.bi_size = in_len;
-        if (sg_skip_bytes(in, in_len - t) < 0)
-            return LZO_E_INPUT_OVERRUN;
-        //TODO: на подумать
-
         if (out_iter.bi_size == out->iter.bi_size && t <= 238)
         {
-            unsigned char prefix = (17 + t);
-            lzom_sg_write1(out, prefix);
+            lzom_sg_write1(out, 17 + t);
         }
         else if (t <= 3)
         {
-            //TODO: на подумать
-    //         op[state_offset] |= t;
+            unsigned char prev_byte = lzom_sg_read_back(out, -state_offset);
+            prev_byte |= t;
+            lzom_sg_write_back(out, prev_byte, -state_offset);
         }
         else if (t <= 18)
         {
-            unsigned char prefix = (t - 3);
-            lzom_sg_write1(out, prefix);
+            lzom_sg_write1(out, t - 3);
         }
         else
         {
             size_t tt = t - 18;
-            unsigned char zero = 0;
-            lzom_sg_write1(out, zero);
+            lzom_sg_write1(out, 0);
 
             while (tt > 255)
             {
                 tt -= 255;
-                lzom_sg_write1(out, zero);
+                lzom_sg_write1(out, 0);
             }
 
-            unsigned char remainder = tt;
-            lzom_sg_write1(out, remainder);
+            lzom_sg_write1(out, (unsigned char)tt);
         }
 
         if (t >= 16)
@@ -488,7 +520,8 @@ static int LZO_SAFE(lzogeneric1x_1_compress)(
         if (t > 0)
         {
             unsigned char tmp[16];
-            lzom_sg_copy(out, in, tmp, t);
+            if (lzom_sg_copy(out, in, tmp, t) < 0)
+                return LZO_E_OUTPUT_OVERRUN;
         }
     }
 
@@ -511,18 +544,18 @@ output_overrun:
 int lzom_compress(struct lzom_sg_buf *src,
                   struct lzom_sg_buf *dst,
                   void *wrkmem)
-{ 
+{
     return LZO_SAFE(lzogeneric1x_1_compress)(
         src, dst, wrkmem, 0);
 }
 
-int lzom_rle_compressstruct(struct lzom_sg_buf *src,
-                            struct lzom_sg_buf *dst,
-                            void *wrkmem)
-{
-    return LZO_SAFE(lzogeneric1x_1_compress)(
-        src, dst, wrkmem, LZO_VERSION);
-}
+// int lzom_rle_compressstruct(struct lzom_sg_buf *src,
+//                             struct lzom_sg_buf *dst,
+//                             void *wrkmem)
+// {
+//     return LZO_SAFE(lzogeneric1x_1_compress)(
+//         src, dst, wrkmem, LZO_VERSION);
+// }
 
 #ifndef LZO_UNSAFE
 MODULE_LICENSE("GPL");

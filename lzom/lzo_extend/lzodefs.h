@@ -34,10 +34,8 @@
 #define LZOM_COPY4(dst_sg, src_sg) \
     lzom_sg_copy4(dst_sg, src_sg)
 
-#if defined(CONFIG_X86_64) || defined(CONFIG_ARM64)
 #define LZOM_COPY8(dst_sg, src_sg) \
     lzom_sg_copy8(dst_sg, src_sg)
-#endif
 
 #if defined(__BIG_ENDIAN) && defined(__LITTLE_ENDIAN)
 #error "conflicting endian definitions"

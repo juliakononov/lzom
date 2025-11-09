@@ -67,7 +67,7 @@ static struct lzom_buffer *lzom_buffer_alloc(size_t size)
     return buf;
 }
 
-static int lzom_copy_from_bio_to_buf(struct bio *bio, struct lzom_buffer *buf)
+int lzom_copy_from_bio_to_buf(struct bio *bio, struct lzom_buffer *buf)
 {
     struct bio_vec bv;
     struct bvec_iter iter;
@@ -166,41 +166,78 @@ static void lzom_read_req_endio(struct bio *bio)
     lzom_req_free(lreq);
 }
 
+static void lzom_init_bvec_array(struct bio_vec *bvec,
+                                 size_t vec_cnt,
+                                 char *data_ptr,
+                                 size_t data_len)
+{
+    size_t i;
+    size_t remaining = data_len;
+    char *cur_ptr = data_ptr;
+
+    for (i = 0; i < vec_cnt && remaining > 0; i++)
+    {
+        size_t page_offset = offset_in_page(cur_ptr);
+        size_t chunk_len = min_t(size_t, remaining, PAGE_SIZE - page_offset);
+
+        bvec[i].bv_page = virt_to_page(cur_ptr);
+        bvec[i].bv_offset = page_offset;
+        bvec[i].bv_len = chunk_len;
+
+        cur_ptr += chunk_len;
+        remaining -= chunk_len;
+    }
+}
+
+static struct lzom_sg_buf lzom_sg_buf_create_with_buf(size_t len, char **data_ptr)
+{
+    size_t vec_cnt = DIV_ROUND_UP(len, PAGE_SIZE) + 1;
+    size_t bvec_mem_len = sizeof(struct bio_vec) * vec_cnt;
+    char *mem, *__data_ptr;
+    struct lzom_sg_buf res;
+
+    BUG_ON(vec_cnt > BIO_MAX_VECS);
+
+    mem = kzalloc(bvec_mem_len + len, GFP_NOIO);
+    BUG_ON(!mem);
+
+    __data_ptr = mem + bvec_mem_len;
+
+    lzom_init_bvec_array((struct bio_vec *)mem, vec_cnt, __data_ptr, len);
+
+    res.bvec = (struct bio_vec *)mem;
+    res.iter.bi_size = len;
+    
+    *data_ptr = __data_ptr;
+    return res;
+}
+
+static void lzom_sg_buf_destroy_with_buf(struct lzom_sg_buf buf)
+{
+    if(buf.bvec)
+        kfree(buf.bvec);
+    
+    memset(&buf.iter, 0, sizeof(buf.iter));
+}
+
+
 static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *original_bio, struct lzom_dev *ldev)
 {
     struct block_device *bdev = ldev->under_dev.bdev;
     struct bio *new_bio;
-    struct lzom_buffer *dst;
-    struct lzom_buffer *src;
+    struct lzom_sg_buf src;
+    struct lzom_sg_buf dst;
     struct lzom_buffer *decomp;
+    char *dst_data_ptr;
+
     int bsize = original_bio->bi_iter.bi_size;
     int ret, lzo_ret;
-    size_t dst_len, decomp_len;
+    size_t decomp_len;
     void *wrkmem;
 
-    src = lzom_buffer_alloc(bsize);
-    if (!src)
-    {
-        LZOM_ERRLOG("failed to alloc src buffer");
-        ret = BLK_STS_RESOURCE;
-        goto err_out;
-    }
-
-    ret = lzom_copy_from_bio_to_buf(original_bio, src);
-    if (ret)
-    {
-        LZOM_ERRLOG("copy from bio failed: %d", ret);
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
-    dst = lzom_buffer_alloc(lzo_worst_compress(bsize));
-    if (!dst)
-    {
-        LZOM_ERRLOG("failed to alloc dst buffer");
-        return BLK_STS_RESOURCE;
-    }
-
+    src = lzom_sg_buf_create(original_bio->bi_iter, original_bio->bi_io_vec);
+    dst = lzom_sg_buf_create_with_buf(lzo_worst_compress(bsize), &dst_data_ptr);
+    
     wrkmem = kzalloc(LZO1X_1_MEM_COMPRESS, GFP_NOIO);
     if (!wrkmem)
     {
@@ -209,13 +246,7 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
         goto err_out;
     }
 
-    dst_len = dst->buf_sz;
-    lzo_ret = lzom_compress(
-        (const unsigned char *)src->data,
-        src->data_sz,
-        (unsigned char *)dst->data,
-        &dst_len,
-        wrkmem);
+    lzo_ret = lzom_compress(&src, &dst,wrkmem);
 
     if (lzo_ret != LZOM_E_OK)
     {
@@ -223,10 +254,6 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
         ret = BLK_STS_IOERR;
         goto err_out;
     }
-    dst->data_sz = dst_len;
-
-    LZOM_LOG("Compressed %u bytes to %u bytes",
-             src->data_sz, dst->data_sz);
 
     decomp = lzom_buffer_alloc(bsize);
     if (!decomp)
@@ -238,8 +265,8 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
 
     decomp_len = decomp->buf_sz;
     lzo_ret = lzom_decompress_safe(
-        (const unsigned char *)dst->data,
-        dst->data_sz,
+        dst_data_ptr,
+        dst.iter.bi_size,
         (unsigned char *)decomp->data,
         &decomp_len);
 
@@ -252,29 +279,11 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
 
     decomp->data_sz = decomp_len;
 
-    if (decomp_len != src->data_sz)
-    {
-        LZOM_ERRLOG("decompressed size mismatch: expected %u, got %zu",
-                    src->data_sz, decomp_len);
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
-    if (memcmp(src->data, decomp->data, src->data_sz) != 0)
-    {
-        LZOM_ERRLOG("decompressed data mismatch");
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
     LZOM_LOG("Decompression verified successfully");
 
     lreq->buffer = decomp;
 
-    lzom_buffer_free(src);
-    src = NULL;
-    lzom_buffer_free(dst);
-    dst = NULL;
+    lzom_sg_buf_destroy_with_buf(dst);
     kfree(wrkmem);
     wrkmem = NULL;
 
@@ -305,12 +314,11 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
     return BLK_STS_OK;
 
 err_out:
-    if (src)
-        lzom_buffer_free(src);
-    if (dst)
-        lzom_buffer_free(dst);
+    lzom_sg_buf_destroy_with_buf(dst);
+
     if (decomp)
         lzom_buffer_free(decomp);
+
     if (lreq->buffer)
     {
         lzom_buffer_free(lreq->buffer);

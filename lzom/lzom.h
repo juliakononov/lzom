@@ -31,4 +31,6 @@ struct lzom_buffer {
     char *data;
 };
 
+int lzom_copy_from_bio_to_buf(struct bio *bio, struct lzom_buffer *buf);
+
 #endif  //LZOM
