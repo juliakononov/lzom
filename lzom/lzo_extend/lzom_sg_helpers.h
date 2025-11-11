@@ -20,7 +20,7 @@ static inline int sg_write_bytes(struct lzom_sg_buf *buf,
         bv = bvec_iter_bvec(buf->bvec, buf->iter);
         to_write = min_t(size_t, bv.bv_len, len);
 
-        memcpy_to_bvec(&bv, (const char *)data);
+        memcpy_to_page(bv.bv_page, bv.bv_offset, (const char *)data, to_write);
 
         bvec_iter_advance(buf->bvec, &buf->iter, to_write);
         data += to_write;
@@ -36,7 +36,7 @@ static inline int sg_read_bytes(struct lzom_sg_buf *buf,
 {
     if (len > buf->iter.bi_size)
         return -EINVAL;
-
+    
     while (len)
     {
         struct bio_vec bv;
@@ -45,7 +45,7 @@ static inline int sg_read_bytes(struct lzom_sg_buf *buf,
         bv = bvec_iter_bvec(buf->bvec, buf->iter);
         to_read = min_t(size_t, bv.bv_len, len);
 
-        memcpy_from_bvec((char *)data, &bv);
+        memcpy_from_page((char *)data, bv.bv_page, bv.bv_offset, to_read);
 
         bvec_iter_advance(buf->bvec, &buf->iter, to_read);
         data += to_read;
@@ -150,7 +150,7 @@ static inline u32 lzom_sg_read4_at(struct lzom_sg_buf *buf,
     return value;
 }
 
-static inline u32 lzom_sg_read8_at(struct lzom_sg_buf *buf,
+static inline u64 lzom_sg_read8_at(struct lzom_sg_buf *buf,
                                    struct bvec_iter start,
                                    size_t offset)
 {

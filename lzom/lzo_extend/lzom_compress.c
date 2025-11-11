@@ -71,9 +71,6 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in,
         if (unlikely(ip_offset >= ip_end))
             break;
 
-        lzom_sg_buf_pr_info(in, "in:76\n");
-        bvec_iter_pr_info(block_start, "block_start:76 ip_offset=%lu\n", ip_offset);
-
         dv = le32_to_cpu(lzom_sg_read4_at(in, block_start, ip_offset));
 #ifndef TODO_IMPLEMENT
         if (dv == 0 && bitstream_version)
