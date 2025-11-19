@@ -21,21 +21,19 @@
 #define LZO_VERSION 1
 
 #define COPY4(dst, src) \
-    put_unaligned(get_unaligned((const u32 *)(src)), (u32 *)(dst))
+	put_unaligned(get_unaligned((const u32 *)(src)), (u32 *)(dst))
 #if defined(CONFIG_X86_64) || defined(CONFIG_ARM64)
 #define COPY8(dst, src) \
-    put_unaligned(get_unaligned((const u64 *)(src)), (u64 *)(dst))
+	put_unaligned(get_unaligned((const u64 *)(src)), (u64 *)(dst))
 #else
-#define COPY8(dst, src) \
-    COPY4(dst, src);    \
-    COPY4((dst) + 4, (src) + 4)
+#define COPY8(dst, src)  \
+	COPY4(dst, src); \
+	COPY4((dst) + 4, (src) + 4)
 #endif
 
-#define LZOM_COPY4(dst_sg, src_sg) \
-    lzom_sg_copy4(dst_sg, src_sg)
+#define LZOM_COPY4(dst_sg, src_sg) lzom_sg_copy4(dst_sg, src_sg)
 
-#define LZOM_COPY8(dst_sg, src_sg) \
-    lzom_sg_copy8(dst_sg, src_sg)
+#define LZOM_COPY8(dst_sg, src_sg) lzom_sg_copy8(dst_sg, src_sg)
 
 #if defined(__BIG_ENDIAN) && defined(__LITTLE_ENDIAN)
 #error "conflicting endian definitions"

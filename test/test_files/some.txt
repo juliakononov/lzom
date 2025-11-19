@@ -3,13 +3,9 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/blkdev.h>
-#include <linux/bvec.h>
 #include <linux/blk_types.h>
-#include <linux/vmalloc.h>
-#include <linux/highmem.h>
 
 #include "lzom.h"
-#include "lzo_extend/lzo_extend.h"
 
 #define LZOM_NAME "lzo_module"
 #define LZOM_INIT_MINOR 0
@@ -29,105 +25,12 @@ static bool lzom_is_exist(void)
 }
 
 /* ----------------- submit bio -----------------*/
-static unsigned short lzom_bio_size_to_pages(size_t size)
-{
-    size_t pages_needed = DIV_ROUND_UP(size, PAGE_SIZE);
-
-    return (unsigned short)min_t(size_t, pages_needed, BIO_MAX_VECS);
-}
-
-static void lzom_buffer_free(struct lzom_buffer *buf)
-{
-    if (buf)
-    {
-        kfree(buf->data);
-        kfree(buf);
-    }
-}
-
-static struct lzom_buffer *lzom_buffer_alloc(size_t size)
-{
-    struct lzom_buffer *buf;
-
-    buf = kzalloc(sizeof(*buf), GFP_NOIO);
-    if (!buf)
-    {
-        LZOM_ERRLOG("failed to allocate buffer structure");
-        return NULL;
-    }
-
-    buf->data = kzalloc(size, GFP_NOIO);
-    if (!buf->data) {
-        LZOM_ERRLOG("failed to allocate buffer data");
-        kfree(buf);
-        return NULL;
-    }
-    
-    buf->buf_sz = size;
-    return buf;
-}
-
-int lzom_copy_from_bio_to_buf(struct bio *bio, struct lzom_buffer *buf)
-{
-    struct bio_vec bv;
-    struct bvec_iter iter;
-    char *ptr = buf->data;
-
-    if (!buf || !buf->data)
-        return -EINVAL;
-
-    if (buf->buf_sz < bio->bi_iter.bi_size)
-        return -EINVAL;
-
-    bio_for_each_segment(bv, bio, iter)
-    {
-        memcpy_from_bvec(ptr, &bv);
-        ptr += bv.bv_len;
-    }
-
-    buf->data_sz = bio->bi_iter.bi_size;
-
-    return 0;
-}
-
-static int lzom_add_buf_to_bio(struct lzom_buffer *buf, u32 part_to_use, struct bio *bio) 
-{
-    char *data = buf->data;
-    unsigned int len = part_to_use;
-    unsigned int pageoff, pagelen;
-    int ret;
-
-    if (buf->buf_sz < part_to_use) {
-        //TODO: LZOM_ERRLOG("");
-        return -EINVAL;
-    }
-
-    pageoff = offset_in_page(data);
-
-    while (len > 0) {
-        pagelen = min_t(unsigned int, len, PAGE_SIZE - pageoff);
-
-        ret = bio_add_page(bio, virt_to_page(data), pagelen, pageoff);
-        if (ret != pagelen)
-        {
-            LZOM_ERRLOG("bio_add_page failed");
-            return -EAGAIN;
-        }
-
-        len -= pagelen;
-        data += pagelen;
-        pageoff = 0;
-    }
-
-    return 0;
-}
 
 static void lzom_req_free(struct lzom_req *lreq)
 {
     if (!lreq)
         return;
 
-    lzom_buffer_free(lreq->buffer);
     kfree(lreq);
 }
 
@@ -166,143 +69,19 @@ static void lzom_read_req_endio(struct bio *bio)
     lzom_req_free(lreq);
 }
 
-static void lzom_init_bvec_array(struct bio_vec *bvec,
-                                 size_t vec_cnt,
-                                 char *data_ptr,
-                                 size_t data_len)
-{
-    size_t i;
-    size_t remaining = data_len;
-    char *cur_ptr = data_ptr;
-
-    for (i = 0; i < vec_cnt && remaining > 0; i++)
-    {
-        size_t page_offset = offset_in_page(cur_ptr);
-        size_t chunk_len = min_t(size_t, remaining, PAGE_SIZE - page_offset);
-
-        bvec[i].bv_page = virt_to_page(cur_ptr);
-        bvec[i].bv_offset = page_offset;
-        bvec[i].bv_len = chunk_len;
-
-        cur_ptr += chunk_len;
-        remaining -= chunk_len;
-    }
-}
-
-static struct lzom_sg_buf lzom_sg_buf_create_with_buf(size_t len, char **data_ptr)
-{
-    size_t vec_cnt = DIV_ROUND_UP(len, PAGE_SIZE) + 1;
-    size_t bvec_mem_len = sizeof(struct bio_vec) * vec_cnt;
-    char *mem, *__data_ptr;
-    struct lzom_sg_buf res;
-
-    BUG_ON(vec_cnt > BIO_MAX_VECS);
-
-    mem = kzalloc(bvec_mem_len + len, GFP_NOIO);
-    BUG_ON(!mem);
-
-    __data_ptr = mem + bvec_mem_len;
-
-    lzom_init_bvec_array((struct bio_vec *)mem, vec_cnt, __data_ptr, len);
-
-    res.bvec = (struct bio_vec *)mem;
-    res.iter.bi_size = len;
-    
-    *data_ptr = __data_ptr;
-    return res;
-}
-
-static void lzom_sg_buf_destroy_with_buf(struct lzom_sg_buf buf)
-{
-    if(buf.bvec)
-        kfree(buf.bvec);
-    
-    memset(&buf.iter, 0, sizeof(buf.iter));
-}
-
-
 static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *original_bio, struct lzom_dev *ldev)
 {
     struct block_device *bdev = ldev->under_dev.bdev;
+    struct bio_set *bset = ldev->under_dev.bset;
     struct bio *new_bio;
-    struct lzom_sg_buf src;
-    struct lzom_sg_buf dst;
-    struct lzom_buffer *decomp;
-    char *dst_data_ptr;
 
-    int bsize = original_bio->bi_iter.bi_size;
-    int ret, lzo_ret;
-    size_t decomp_len;
-    void *wrkmem;
-
-    src = lzom_sg_buf_create(original_bio->bi_iter, original_bio->bi_io_vec);
-    dst = lzom_sg_buf_create_with_buf(lzo_worst_compress(bsize), &dst_data_ptr);
-    
-    wrkmem = kzalloc(LZO1X_1_MEM_COMPRESS, GFP_NOIO);
-    if (!wrkmem)
-    {
-        LZOM_ERRLOG("failed to alloc wrkmem");
-        ret = BLK_STS_RESOURCE;
-        goto err_out;
+    new_bio = bio_alloc_clone(bdev, original_bio, GFP_NOIO, bset);
+    if (!new_bio) {
+        LZOM_ERRLOG("failed to clone original bio");
+        return BLK_STS_RESOURCE;
     }
 
-    lzo_ret = lzom_compress(&src, &dst,wrkmem);
-
-    if (lzo_ret != LZOM_E_OK)
-    {
-        LZOM_ERRLOG("lzom compress failed: %d", lzo_ret);
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
-    decomp = lzom_buffer_alloc(bsize);
-    if (!decomp)
-    {
-        LZOM_ERRLOG("failed to alloc decomp buffer");
-        ret = BLK_STS_RESOURCE;
-        goto err_out;
-    }
-
-    decomp_len = decomp->buf_sz;
-    lzo_ret = lzom_decompress_safe(
-        dst_data_ptr,
-        dst.iter.bi_size,
-        (unsigned char *)decomp->data,
-        &decomp_len);
-
-    if (lzo_ret != LZOM_E_OK)
-    {
-        LZOM_ERRLOG("lzom decompress failed: %d", lzo_ret);
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
-    decomp->data_sz = decomp_len;
-
-    LZOM_LOG("Decompression verified successfully");
-
-    lreq->buffer = decomp;
-
-    lzom_sg_buf_destroy_with_buf(dst);
-    kfree(wrkmem);
-    wrkmem = NULL;
-
-    new_bio = bio_alloc(bdev, lzom_bio_size_to_pages(bsize), original_bio->bi_opf, GFP_NOIO);
-    if (!new_bio)
-    {
-        LZOM_ERRLOG("failed to alloc new bio");
-        ret = BLK_STS_RESOURCE;
-        goto err_out;
-    }
-
-    ret = lzom_add_buf_to_bio(lreq->buffer, bsize, new_bio);
-    if (ret != 0)
-    {
-        LZOM_ERRLOG("failed to add buffer to bio");
-        ret = BLK_STS_IOERR;
-        goto err_out;
-    }
-
+    // new_bio->bi_vcnt = original_bio->bi_vcnt;
     new_bio->bi_end_io = lzom_write_req_endio;
     new_bio->bi_private = lreq;
     new_bio->bi_iter.bi_sector = original_bio->bi_iter.bi_sector;
@@ -311,24 +90,8 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq, struct bio *ori
     lreq->new_bio = new_bio;
 
     submit_bio_noacct(new_bio);
+
     return BLK_STS_OK;
-
-err_out:
-    lzom_sg_buf_destroy_with_buf(dst);
-
-    if (decomp)
-        lzom_buffer_free(decomp);
-
-    if (lreq->buffer)
-    {
-        lzom_buffer_free(lreq->buffer);
-        lreq->buffer = NULL;
-    }
-    if (new_bio)
-        bio_put(new_bio);
-    if (wrkmem)
-        kfree(wrkmem);
-    return ret;
 }
 
 static blk_status_t lzom_read_req_submit(struct lzom_req *lreq, struct bio *original_bio, struct lzom_dev *ldev)
@@ -365,6 +128,19 @@ static void lzom_submit_bio(struct bio *original_bio)
         LZOM_ERRLOG("invalid device context");
         goto submit_bio_with_err;
     }
+
+    // if (original_bio->bi_iter.bi_size != SUPPORTED_BS)
+    // {
+    //     /* TODO: чет не пон
+    //     TODO:(#MINDIT) [ implemetation features, SUPPORTED_BS ]
+    //         current implementation of READ and WRITE correctly works only while
+    //         * original_bio->bi_iter.bi_size == SUPPORTED_BS
+    //         * SUPPORTED_BS == req->ldev->block_size
+    //     */
+    //     LZOM_ERRLOG("unsupported block size: %u (expected: %u)",
+    //                 original_bio->bi_iter.bi_size, SUPPORTED_BS);
+    //     goto submit_bio_with_err;
+    // }
 
     lreq = lzom_req_alloc();
     if (!lreq) {
@@ -560,60 +336,4 @@ static int lzom_blk_create(const char *arg, const struct kernel_param *kp)
     if (ret)
         goto err;
 
-    LZOM_LOG("device mapped: %s", arg);
-    return 0;
-
-err:
-    LZOM_ERRLOG("device mapping failed: error %d", ret);
-    lzom_dev_deinit(&lzom.dev);
-    lzom_path_remove();
-
-    return ret;
-}
-
-static int lzom_blk_get(char *buf, const struct kernel_param *kp)
-{
-    size_t len;
-
-    if (!lzom.dev_path)
-        return -EINVAL;
-
-    len = strlen(lzom.dev_path);
-    strcpy(buf, lzom.dev_path);
-
-    return len;
-}
-
-static const struct kernel_param_ops lzom_blk = {
-    .set = lzom_blk_create,
-    .get = lzom_blk_get,
-};
-
-MODULE_PARM_DESC(path, "Path to the module");
-module_param_cb(path, &lzom_blk, NULL, S_IRUGO | S_IWUSR);
-
-static int __init lzom_init(void)
-{
-    lzom.major = register_blkdev(0, LZOM_NAME);
-    if (lzom.major < 0) {
-        LZOM_ERRLOG("module NOT loaded");
-        return -EIO;
-    }
-
-    LZOM_LOG("module loaded");
-    return 0;
-}
-
-static void __exit lzom_exit(void)
-{
-    unregister_blkdev(lzom.major, LZOM_NAME);
-    lzom_blk_destroy();
-
-    LZOM_LOG("module unloaded");
-}
-
-module_init(lzom_init);
-module_exit(lzom_exit);
-
-MODULE_AUTHOR("Kononova Julia");
-MODULE_LICENSE("GPL");
+    LZOM_LOG("device
