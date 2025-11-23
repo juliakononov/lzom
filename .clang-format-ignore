@@ -1,0 +1,2 @@
+# Do not format lzom library sources
+lzo_extend/*
