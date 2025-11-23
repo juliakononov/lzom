@@ -13,18 +13,25 @@
  */
 
 #ifndef STATIC
-#include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #endif
 #include <linux/unaligned.h>
-#include <linux/lzo.h>
-#include "lzodefs.h"
 
-#define HAVE_IP(x)      ((size_t)(ip_end - ip) >= (size_t)(x))
-#define HAVE_OP(x)      ((size_t)(op_end - op) >= (size_t)(x))
-#define NEED_IP(x)      if (!HAVE_IP(x)) goto input_overrun
-#define NEED_OP(x)      if (!HAVE_OP(x)) goto output_overrun
-#define TEST_LB(m_pos)  if ((m_pos) < out) goto lookbehind_overrun
+#include "include/lzom_extend.h"
+#include "include/lzomdefs.h"
+
+#define HAVE_IP(x) ((size_t)(ip_end - ip) >= (size_t)(x))
+#define HAVE_OP(x) ((size_t)(op_end - op) >= (size_t)(x))
+#define NEED_IP(x)                 \
+	if (unlikely(!HAVE_IP(x))) \
+	goto input_overrun
+#define NEED_OP(x)                 \
+	if (unlikely(!HAVE_OP(x))) \
+	goto output_overrun
+#define TEST_LB(m_pos)               \
+	if (unlikely((m_pos) < out)) \
+	goto lookbehind_overrun
 
 /* This MAX_255_COUNT is the maximum number of times we can add 255 to a base
  * count without overflowing an integer. The multiply will overflow when
@@ -34,18 +41,18 @@
  * or equal to 2*255, thus we can always prevent any overflow by accepting
  * two less 255 steps. See Documentation/staging/lzo.rst for more information.
  */
-#define MAX_255_COUNT      ((((size_t)~0) / 255) - 2)
+#define MAX_255_COUNT ((((size_t)~0) / 255) - 2)
 
-int lzo1x_decompress_safe(const unsigned char *in, size_t in_len,
-			  unsigned char *out, size_t *out_len)
+int lzom_decompress_safe(const unsigned char *in, size_t in_len,
+			 unsigned char *out, size_t *out_len)
 {
 	unsigned char *op;
 	const unsigned char *ip;
 	size_t t, next;
 	size_t state = 0;
 	const unsigned char *m_pos;
-	const unsigned char * const ip_end = in + in_len;
-	unsigned char * const op_end = out + *out_len;
+	const unsigned char *const ip_end = in + in_len;
+	unsigned char *const op_end = out + *out_len;
 
 	unsigned char bitstream_version;
 
@@ -91,9 +98,10 @@ int lzo1x_decompress_safe(const unsigned char *in, size_t in_len,
 					t += offset + 15 + *ip++;
 				}
 				t += 3;
-copy_literal_run:
+			copy_literal_run:
 #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-				if (likely(HAVE_IP(t + 15) && HAVE_OP(t + 15))) {
+				if (likely(HAVE_IP(t + 15) &&
+					   HAVE_OP(t + 15))) {
 					const unsigned char *ie = ip + t;
 					unsigned char *oe = op + t;
 					do {
@@ -168,8 +176,7 @@ copy_literal_run:
 			NEED_IP(2);
 			next = get_unaligned_le16(ip);
 			if (((next & 0xfffc) == 0xfffc) &&
-			    ((t & 0xf8) == 0x18) &&
-			    likely(bitstream_version)) {
+			    ((t & 0xf8) == 0x18) && likely(bitstream_version)) {
 				NEED_IP(3);
 				t &= 7;
 				t |= ip[2] << 3;
@@ -249,7 +256,7 @@ copy_literal_run:
 				*op++ = *m_pos++;
 			} while (op < oe);
 		}
-match_next:
+	match_next:
 		state = next;
 		t = next;
 #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
@@ -271,9 +278,10 @@ match_next:
 
 eof_found:
 	*out_len = op - out;
-	return (t != 3       ? LZO_E_ERROR :
+	return (t != 3	     ? LZO_E_ERROR :
 		ip == ip_end ? LZO_E_OK :
-		ip <  ip_end ? LZO_E_INPUT_NOT_CONSUMED : LZO_E_INPUT_OVERRUN);
+		ip < ip_end  ? LZO_E_INPUT_NOT_CONSUMED :
+			       LZO_E_INPUT_OVERRUN);
 
 input_overrun:
 	*out_len = op - out;
@@ -288,7 +296,7 @@ lookbehind_overrun:
 	return LZO_E_LOOKBEHIND_OVERRUN;
 }
 #ifndef STATIC
-EXPORT_SYMBOL_GPL(lzo1x_decompress_safe);
+// EXPORT_SYMBOL_GPL(lzom_decompress_safe);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("LZO1X Decompressor");
