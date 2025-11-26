@@ -10,6 +10,9 @@
  *  Changed for Linux kernel use by:
  *  Nitin Gupta <nitingupta910@gmail.com>
  *  Richard Purdie <rpurdie@openedhand.com>
+ *
+ *  Modified by:
+ *  julickononov <julickkria@gmail.com>
  */
 
 #ifndef STATIC
