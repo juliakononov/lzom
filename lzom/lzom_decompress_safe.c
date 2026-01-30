@@ -10,21 +10,31 @@
  *  Changed for Linux kernel use by:
  *  Nitin Gupta <nitingupta910@gmail.com>
  *  Richard Purdie <rpurdie@openedhand.com>
+ *
+ *  Modified by:
+ *  julickononov <julickkria@gmail.com>
  */
 
 #ifndef STATIC
-#include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #endif
 #include <linux/unaligned.h>
-#include <linux/lzo.h>
-#include "lzodefs.h"
 
-#define HAVE_IP(x)      ((size_t)(ip_end - ip) >= (size_t)(x))
-#define HAVE_OP(x)      ((size_t)(op_end - op) >= (size_t)(x))
-#define NEED_IP(x)      if (!HAVE_IP(x)) goto input_overrun
-#define NEED_OP(x)      if (!HAVE_OP(x)) goto output_overrun
-#define TEST_LB(m_pos)  if ((m_pos) < out) goto lookbehind_overrun
+#include "include/lzom_extend.h"
+#include "include/lzomdefs.h"
+
+#define HAVE_IP(x) ((size_t)(ip_end - ip) >= (size_t)(x))
+#define HAVE_OP(x) ((size_t)(op_end - op) >= (size_t)(x))
+#define NEED_IP(x)                 \
+	if (unlikely(!HAVE_IP(x))) \
+	goto input_overrun
+#define NEED_OP(x)                 \
+	if (unlikely(!HAVE_OP(x))) \
+	goto output_overrun
+#define TEST_LB(m_pos)               \
+	if (unlikely((m_pos) < out)) \
+	goto lookbehind_overrun
 
 /* This MAX_255_COUNT is the maximum number of times we can add 255 to a base
  * count without overflowing an integer. The multiply will overflow when
@@ -34,10 +44,10 @@
  * or equal to 2*255, thus we can always prevent any overflow by accepting
  * two less 255 steps. See Documentation/staging/lzo.rst for more information.
  */
-#define MAX_255_COUNT      ((((size_t)~0) / 255) - 2)
+#define MAX_255_COUNT ((((size_t)~0) / 255) - 2)
 
-int lzo1x_decompress_safe(const unsigned char *in, size_t in_len,
-			  unsigned char *out, size_t *out_len)
+int lzom_decompress_safe(const unsigned char *in, size_t in_len,
+			 unsigned char *out, size_t *out_len)
 {
 	unsigned char *op;
 	const unsigned char *ip;
@@ -288,7 +298,7 @@ lookbehind_overrun:
 	return LZO_E_LOOKBEHIND_OVERRUN;
 }
 #ifndef STATIC
-EXPORT_SYMBOL_GPL(lzo1x_decompress_safe);
+// EXPORT_SYMBOL_GPL(lzom_decompress_safe);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("LZO1X Decompressor");
