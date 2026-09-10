@@ -141,6 +141,10 @@ LZO_SAFE(lzo1x_1_do_compress)(struct lzom_sg_buf *in, size_t in_len,
 			goto literal;
 		// }  TODO_IMPLEMENT
 
+		if (ti > 0) {
+			if (lzom_sg_move_back(in, &ii_iter, ti) < 0)
+				return LZO_E_ERROR;
+		}
 		ii_offset -= ti;
 		ti = 0;
 		t = ip_offset - ii_offset;
