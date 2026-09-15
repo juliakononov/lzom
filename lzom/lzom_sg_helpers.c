@@ -110,13 +110,16 @@ u64 lzom_sg_read8_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 int lzom_sg_move_back(struct lzom_sg_buf *buf, struct bvec_iter *iter,
 		      size_t offset)
 {
-	while (offset > 0) {
-		if (iter->bi_bvec_done >= offset) {
-			iter->bi_bvec_done -= offset;
+	size_t remaining = offset;
+
+	while (remaining > 0) {
+		if (iter->bi_bvec_done >= remaining) {
+			iter->bi_bvec_done -= remaining;
+			iter->bi_size += offset;
 			return 0;
 		}
 
-		offset -= iter->bi_bvec_done;
+		remaining -= iter->bi_bvec_done;
 
 		if (iter->bi_idx == 0)
 			return -EINVAL;
@@ -124,6 +127,7 @@ int lzom_sg_move_back(struct lzom_sg_buf *buf, struct bvec_iter *iter,
 		iter->bi_idx--;
 		iter->bi_bvec_done = buf->bvec[iter->bi_idx].bv_len;
 	}
+	iter->bi_size += offset;
 	return 0;
 }
 
