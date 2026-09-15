@@ -79,6 +79,20 @@ unsigned char lzom_sg_read1_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 	return value;
 }
 
+u16 lzom_sg_read2_at(struct lzom_sg_buf *buf, struct bvec_iter start,
+		     size_t offset)
+{
+	struct bvec_iter saved = buf->iter;
+	u16 value;
+
+	buf->iter = start;
+	sg_skip_bytes(buf, offset);
+	value = lzom_sg_read2(buf);
+	buf->iter = saved;
+
+	return value;
+}
+
 u32 lzom_sg_read4_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 		     size_t offset)
 {
@@ -161,4 +175,84 @@ int lzom_sg_write_back(struct lzom_sg_buf *buf, unsigned char value,
 	buf->iter = saved;
 
 	return 0;
+}
+
+int sg_write_zeros(struct lzom_sg_buf *buf, size_t len)
+{
+	static const unsigned char zeros[32];
+
+	while (len) {
+		size_t chunk = min_t(size_t, len, sizeof(zeros));
+
+		if (sg_write_bytes(buf, zeros, chunk) < 0)
+			return -EINVAL;
+
+		len -= chunk;
+	}
+
+	return 0;
+}
+
+int lzom_sg_count_zero_run(struct lzom_sg_buf *in, size_t max_count,
+			   size_t *count)
+{
+	size_t n = 0;
+
+	for (;;) {
+		unsigned char byte;
+
+		if (unlikely(in->iter.bi_size < 1))
+			return LZO_E_INPUT_OVERRUN;
+
+		byte = lzom_sg_read1(in);
+		if (byte != 0) {
+			if (unlikely(lzom_sg_move_back(in, &in->iter, 1) < 0))
+				return LZO_E_ERROR;
+			break;
+		}
+
+		if (unlikely(++n > max_count))
+			return LZO_E_ERROR;
+	}
+
+	*count = n;
+	return LZO_E_OK;
+}
+
+int lzom_sg_match_copy(struct lzom_sg_buf *out, size_t distance, size_t t)
+{
+	struct bvec_iter src_iter = out->iter;
+	struct lzom_sg_buf src;
+
+	if (unlikely(lzom_sg_move_back(out, &src_iter, distance) < 0))
+		return LZO_E_LOOKBEHIND_OVERRUN;
+
+	if (unlikely(t > out->iter.bi_size))
+		return LZO_E_OUTPUT_OVERRUN;
+
+	src = lzom_sg_buf_create(src_iter, out->bvec);
+
+	if (distance >= 8) {
+		while (t >= 8) {
+			lzom_sg_copy8(out, &src);
+			t -= 8;
+		}
+	}
+	while (t > 0) {
+		lzom_sg_copy1(out, &src);
+		t--;
+	}
+
+	return LZO_E_OK;
+}
+
+void lzom_sg_finish(struct lzom_sg_buf *in, struct bvec_iter in_start,
+		    struct lzom_sg_buf *out, struct bvec_iter out_start,
+		    size_t out_cap)
+{
+	size_t out_len = out_cap - out->iter.bi_size;
+
+	out->iter = out_start;
+	out->iter.bi_size = out_len;
+	in->iter = in_start;
 }

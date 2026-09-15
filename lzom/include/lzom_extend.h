@@ -47,7 +47,6 @@ static inline struct lzom_sg_buf lzom_sg_buf_create(struct bvec_iter iter,
 int lzom_compress(struct lzom_sg_buf *src, struct lzom_sg_buf *dst,
 		  void *wrkmem);
 
-int lzom_decompress_safe(const unsigned char *in, size_t in_len,
-			 unsigned char *out, size_t *out_len);
+int lzom_decompress_safe(struct lzom_sg_buf *in, struct lzom_sg_buf *out);
 
 #endif /* _LZO_EXTEND_H */

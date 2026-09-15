@@ -22,19 +22,17 @@
 #include <linux/unaligned.h>
 
 #include "include/lzom_extend.h"
+#include "include/lzom_sg_helpers.h"
 #include "include/lzomdefs.h"
 
-#define HAVE_IP(x) ((size_t)(ip_end - ip) >= (size_t)(x))
-#define HAVE_OP(x) ((size_t)(op_end - op) >= (size_t)(x))
+#define HAVE_IP(x) (in->iter.bi_size >= (size_t)(x))
+#define HAVE_OP(x) (out->iter.bi_size >= (size_t)(x))
 #define NEED_IP(x)                 \
 	if (unlikely(!HAVE_IP(x))) \
 	goto input_overrun
 #define NEED_OP(x)                 \
 	if (unlikely(!HAVE_OP(x))) \
 	goto output_overrun
-#define TEST_LB(m_pos)               \
-	if (unlikely((m_pos) < out)) \
-	goto lookbehind_overrun
 
 /* This MAX_255_COUNT is the maximum number of times we can add 255 to a base
  * count without overflowing an integer. The multiply will overflow when
@@ -46,34 +44,31 @@
  */
 #define MAX_255_COUNT ((((size_t)~0) / 255) - 2)
 
-int lzom_decompress_safe(const unsigned char *in, size_t in_len,
-			 unsigned char *out, size_t *out_len)
+int lzom_decompress_safe(struct lzom_sg_buf *in, struct lzom_sg_buf *out)
 {
-	unsigned char *op;
-	const unsigned char *ip;
+	struct bvec_iter in_iter = in->iter;
+	struct bvec_iter out_iter = out->iter;
+	size_t out_cap = out->iter.bi_size;
+
 	size_t t, next;
 	size_t state = 0;
-	const unsigned char *m_pos;
-	const unsigned char * const ip_end = in + in_len;
-	unsigned char * const op_end = out + *out_len;
-
+	size_t distance;
 	unsigned char bitstream_version;
+	int ret;
 
-	op = out;
-	ip = in;
-
-	if (unlikely(in_len < 3))
+	if (unlikely(!HAVE_IP(3)))
 		goto input_overrun;
 
-	if (likely(in_len >= 5) && likely(*ip == 17)) {
-		bitstream_version = ip[1];
-		ip += 2;
+	if (likely(HAVE_IP(5)) &&
+	    likely(lzom_sg_read1_at(in, in->iter, 0) == 17)) {
+		bitstream_version = lzom_sg_read1_at(in, in->iter, 1);
+		sg_skip_bytes(in, 2);
 	} else {
 		bitstream_version = 0;
 	}
 
-	if (*ip > 17) {
-		t = *ip++ - 17;
+	if (lzom_sg_read1_at(in, in->iter, 0) > 17) {
+		t = lzom_sg_read1(in) - 17;
 		if (t < 4) {
 			next = t;
 			goto match_next;
@@ -82,219 +77,167 @@ int lzom_decompress_safe(const unsigned char *in, size_t in_len,
 	}
 
 	for (;;) {
-		t = *ip++;
+		t = lzom_sg_read1(in);
 		if (t < 16) {
 			if (likely(state == 0)) {
 				if (unlikely(t == 0)) {
-					size_t offset;
-					const unsigned char *ip_last = ip;
+					size_t zrun;
 
-					while (unlikely(*ip == 0)) {
-						ip++;
-						NEED_IP(1);
-					}
-					offset = ip - ip_last;
-					if (unlikely(offset > MAX_255_COUNT))
-						return LZO_E_ERROR;
+					ret = lzom_sg_count_zero_run(
+						in, MAX_255_COUNT, &zrun);
+					if (unlikely(ret ==
+						     LZO_E_INPUT_OVERRUN))
+						goto input_overrun;
+					if (unlikely(ret != LZO_E_OK))
+						return ret;
 
-					offset = (offset << 8) - offset;
-					t += offset + 15 + *ip++;
+					t += ((zrun << 8) - zrun) + 15 +
+					     lzom_sg_read1(in);
 				}
 				t += 3;
-copy_literal_run:
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-				if (likely(HAVE_IP(t + 15) && HAVE_OP(t + 15))) {
-					const unsigned char *ie = ip + t;
-					unsigned char *oe = op + t;
-					do {
-						COPY8(op, ip);
-						op += 8;
-						ip += 8;
-						COPY8(op, ip);
-						op += 8;
-						ip += 8;
-					} while (ip < ie);
-					ip = ie;
-					op = oe;
-				} else
-#endif
-				{
-					NEED_OP(t);
-					NEED_IP(t + 3);
-					do {
-						*op++ = *ip++;
-					} while (--t > 0);
+			copy_literal_run:
+				NEED_OP(t);
+				NEED_IP(t + 3);
+				while (t >= 8) {
+					LZOM_COPY8(out, in);
+					t -= 8;
+				}
+				if (t > 0) {
+					unsigned char tmp[8];
+
+					lzom_sg_copy(out, in, tmp, t);
 				}
 				state = 4;
 				continue;
 			} else if (state != 4) {
 				next = t & 3;
-				m_pos = op - 1;
-				m_pos -= t >> 2;
-				m_pos -= *ip++ << 2;
-				TEST_LB(m_pos);
-				NEED_OP(2);
-				op[0] = m_pos[0];
-				op[1] = m_pos[1];
-				op += 2;
+				distance = 1 + (t >> 2) +
+					   ((size_t)lzom_sg_read1(in) << 2);
+				ret = lzom_sg_match_copy(out, distance, 2);
+				if (unlikely(ret == LZO_E_LOOKBEHIND_OVERRUN))
+					goto lookbehind_overrun;
+				if (unlikely(ret == LZO_E_OUTPUT_OVERRUN))
+					goto output_overrun;
 				goto match_next;
 			} else {
 				next = t & 3;
-				m_pos = op - (1 + M2_MAX_OFFSET);
-				m_pos -= t >> 2;
-				m_pos -= *ip++ << 2;
+				distance = (1 + M2_MAX_OFFSET) + (t >> 2) +
+					   ((size_t)lzom_sg_read1(in) << 2);
 				t = 3;
 			}
 		} else if (t >= 64) {
 			next = t & 3;
-			m_pos = op - 1;
-			m_pos -= (t >> 2) & 7;
-			m_pos -= *ip++ << 3;
+			distance = 1 + ((t >> 2) & 7) +
+				   ((size_t)lzom_sg_read1(in) << 3);
 			t = (t >> 5) - 1 + (3 - 1);
 		} else if (t >= 32) {
 			t = (t & 31) + (3 - 1);
 			if (unlikely(t == 2)) {
-				size_t offset;
-				const unsigned char *ip_last = ip;
+				size_t zrun;
 
-				while (unlikely(*ip == 0)) {
-					ip++;
-					NEED_IP(1);
-				}
-				offset = ip - ip_last;
-				if (unlikely(offset > MAX_255_COUNT))
-					return LZO_E_ERROR;
+				ret = lzom_sg_count_zero_run(in, MAX_255_COUNT,
+							     &zrun);
+				if (unlikely(ret == LZO_E_INPUT_OVERRUN))
+					goto input_overrun;
+				if (unlikely(ret != LZO_E_OK))
+					return ret;
 
-				offset = (offset << 8) - offset;
-				t += offset + 31 + *ip++;
-				NEED_IP(2);
+				t += ((zrun << 8) - zrun) + 31 +
+				     lzom_sg_read1(in);
 			}
-			m_pos = op - 1;
-			next = get_unaligned_le16(ip);
-			ip += 2;
-			m_pos -= next >> 2;
-			next &= 3;
+			{
+				u16 v = le16_to_cpu(lzom_sg_read2(in));
+
+				distance = 1 + (v >> 2);
+				next = v & 3;
+			}
 		} else {
 			NEED_IP(2);
-			next = get_unaligned_le16(ip);
-			if (((next & 0xfffc) == 0xfffc) &&
-			    ((t & 0xf8) == 0x18) &&
-			    likely(bitstream_version)) {
-				NEED_IP(3);
-				t &= 7;
-				t |= ip[2] << 3;
-				t += MIN_ZERO_RUN_LENGTH;
-				NEED_OP(t);
-				memset(op, 0, t);
-				op += t;
-				next &= 3;
-				ip += 3;
-				goto match_next;
-			} else {
-				m_pos = op;
-				m_pos -= (t & 8) << 11;
+			{
+				u16 v = le16_to_cpu(
+					lzom_sg_read2_at(in, in->iter, 0));
+
+				if (((v & 0xfffc) == 0xfffc) &&
+				    ((t & 0xf8) == 0x18) &&
+				    likely(bitstream_version)) {
+					NEED_IP(3);
+					t &= 7;
+					t |= (size_t)lzom_sg_read1_at(
+						     in, in->iter, 2)
+					     << 3;
+					t += MIN_ZERO_RUN_LENGTH;
+					NEED_OP(t);
+					sg_write_zeros(out, t);
+					next = v & 3;
+					sg_skip_bytes(in, 3);
+					goto match_next;
+				}
+
+				distance = (t & 8) << 11;
 				t = (t & 7) + (3 - 1);
 				if (unlikely(t == 2)) {
-					size_t offset;
-					const unsigned char *ip_last = ip;
+					size_t zrun;
 
-					while (unlikely(*ip == 0)) {
-						ip++;
-						NEED_IP(1);
-					}
-					offset = ip - ip_last;
-					if (unlikely(offset > MAX_255_COUNT))
-						return LZO_E_ERROR;
+					ret = lzom_sg_count_zero_run(
+						in, MAX_255_COUNT, &zrun);
+					if (unlikely(ret ==
+						     LZO_E_INPUT_OVERRUN))
+						goto input_overrun;
+					if (unlikely(ret != LZO_E_OK))
+						return ret;
 
-					offset = (offset << 8) - offset;
-					t += offset + 7 + *ip++;
+					t += ((zrun << 8) - zrun) + 7 +
+					     lzom_sg_read1(in);
 					NEED_IP(2);
-					next = get_unaligned_le16(ip);
+					v = le16_to_cpu(lzom_sg_read2_at(
+						in, in->iter, 0));
 				}
-				ip += 2;
-				m_pos -= next >> 2;
-				next &= 3;
-				if (m_pos == op)
+				sg_skip_bytes(in, 2);
+				distance += v >> 2;
+				next = v & 3;
+				if (distance == 0)
 					goto eof_found;
-				m_pos -= 0x4000;
+				distance += 0x4000;
 			}
 		}
-		TEST_LB(m_pos);
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-		if (op - m_pos >= 8) {
-			unsigned char *oe = op + t;
-			if (likely(HAVE_OP(t + 15))) {
-				do {
-					COPY8(op, m_pos);
-					op += 8;
-					m_pos += 8;
-					COPY8(op, m_pos);
-					op += 8;
-					m_pos += 8;
-				} while (op < oe);
-				op = oe;
-				if (HAVE_IP(6)) {
-					state = next;
-					COPY4(op, ip);
-					op += next;
-					ip += next;
-					continue;
-				}
-			} else {
-				NEED_OP(t);
-				do {
-					*op++ = *m_pos++;
-				} while (op < oe);
-			}
-		} else
-#endif
-		{
-			unsigned char *oe = op + t;
-			NEED_OP(t);
-			op[0] = m_pos[0];
-			op[1] = m_pos[1];
-			op += 2;
-			m_pos += 2;
-			do {
-				*op++ = *m_pos++;
-			} while (op < oe);
-		}
-match_next:
+
+		ret = lzom_sg_match_copy(out, distance, t);
+		if (unlikely(ret == LZO_E_LOOKBEHIND_OVERRUN))
+			goto lookbehind_overrun;
+		if (unlikely(ret == LZO_E_OUTPUT_OVERRUN))
+			goto output_overrun;
+	match_next:
 		state = next;
 		t = next;
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-		if (likely(HAVE_IP(6) && HAVE_OP(4))) {
-			COPY4(op, ip);
-			op += t;
-			ip += t;
-		} else
-#endif
-		{
-			NEED_IP(t + 3);
-			NEED_OP(t);
-			while (t > 0) {
-				*op++ = *ip++;
-				t--;
-			}
+		NEED_IP(t + 3);
+		NEED_OP(t);
+		while (t > 0) {
+			lzom_sg_copy1(out, in);
+			t--;
 		}
 	}
 
-eof_found:
-	*out_len = op - out;
-	return (t != 3       ? LZO_E_ERROR :
-		ip == ip_end ? LZO_E_OK :
-		ip <  ip_end ? LZO_E_INPUT_NOT_CONSUMED : LZO_E_INPUT_OVERRUN);
+eof_found: {
+	size_t in_remaining = in->iter.bi_size;
+
+	lzom_sg_finish(in, in_iter, out, out_iter, out_cap);
+
+	if (t != 3)
+		return LZO_E_ERROR;
+
+	return in_remaining == 0 ? LZO_E_OK : LZO_E_INPUT_NOT_CONSUMED;
+}
 
 input_overrun:
-	*out_len = op - out;
+	lzom_sg_finish(in, in_iter, out, out_iter, out_cap);
 	return LZO_E_INPUT_OVERRUN;
 
 output_overrun:
-	*out_len = op - out;
+	lzom_sg_finish(in, in_iter, out, out_iter, out_cap);
 	return LZO_E_OUTPUT_OVERRUN;
 
 lookbehind_overrun:
-	*out_len = op - out;
+	lzom_sg_finish(in, in_iter, out, out_iter, out_cap);
 	return LZO_E_LOOKBEHIND_OVERRUN;
 }
 #ifndef STATIC
