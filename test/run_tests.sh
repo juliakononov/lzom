@@ -51,28 +51,32 @@ test_file() {
     local file=$1
     local bs=$2
     local name=$(basename "$file")
-    
-    echo -n "Testing $name (bs=$bs)... "
-    
     local size=$(stat -c%s "$file")
-    [ $size -lt $bs ] && { echo "SKIP (too small)"; return; }
-    
-    # Write/Read
-    dd if="$file" of="$DEVICE" bs=$bs count=1 oflag=direct 2>/dev/null || { echo "FAIL (write)"; FAILED=$((FAILED+1)); return; }
-    dd if="$DEVICE" of=/tmp/out.tmp bs=$bs count=1 iflag=direct 2>/dev/null || { echo "FAIL (read)"; FAILED=$((FAILED+1)); return; }
-    
-    # Verify
-    dd if="$file" of=/tmp/orig.tmp bs=$bs count=1 2>/dev/null
-    
-    if diff -q /tmp/orig.tmp /tmp/out.tmp >/dev/null 2>&1; then
+
+    echo -n "Testing $name (bs=$bs, size=$size, whole file)... "
+
+    local aligned_size=$(( (size + bs - 1) / bs * bs ))
+    local count=$(( aligned_size / bs ))
+    local padded=/tmp/lzom_test_padded.tmp
+    local out=/tmp/lzom_test_out.tmp
+
+    cp "$file" "$padded"
+    truncate -s "$aligned_size" "$padded"
+
+    dd if="$padded" of="$DEVICE" bs=$bs count=$count oflag=direct 2>/dev/null \
+        || { echo "FAIL (write)"; FAILED=$((FAILED+1)); rm -f "$padded"; return; }
+    dd if="$DEVICE" of="$out" bs=$bs count=$count iflag=direct 2>/dev/null \
+        || { echo "FAIL (read)"; FAILED=$((FAILED+1)); rm -f "$padded" "$out"; return; }
+
+    if cmp -s <(head -c "$size" "$out") "$file"; then
         echo "OK"
         PASSED=$((PASSED+1))
     else
         echo "FAIL (mismatch)"
         FAILED=$((FAILED+1))
     fi
-    
-    rm -f /tmp/out.tmp /tmp/orig.tmp
+
+    rm -f "$padded" "$out"
 }
 
 echo ""
@@ -82,9 +86,9 @@ BLOCK_SIZES=(4096 8192)
 
 for file in "$TEST_FILES"/*; do
     [ -f "$file" ] || continue
-    
+
     for bs in "${BLOCK_SIZES[@]}"; do
-        test_file "$file" $bs
+        test_file "$file" "$bs"
     done
 done
 

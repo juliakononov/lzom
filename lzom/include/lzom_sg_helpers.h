@@ -20,6 +20,8 @@ int lzom_sg_write_back(struct lzom_sg_buf *buf, unsigned char value,
 
 unsigned char lzom_sg_read1_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 			       size_t offset);
+u16 lzom_sg_read2_at(struct lzom_sg_buf *buf, struct bvec_iter start,
+		     size_t offset);
 u32 lzom_sg_read4_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 		     size_t offset);
 u64 lzom_sg_read8_at(struct lzom_sg_buf *buf, struct bvec_iter start,
@@ -37,6 +39,18 @@ static inline unsigned char lzom_sg_read1(struct lzom_sg_buf *buf)
 static inline void lzom_sg_write1(struct lzom_sg_buf *buf, unsigned char data)
 {
 	sg_write_bytes(buf, &data, sizeof(data));
+}
+
+static inline u16 lzom_sg_read2(struct lzom_sg_buf *buf)
+{
+	u16 data;
+	sg_read_bytes(buf, (unsigned char *)&data, sizeof(data));
+	return data;
+}
+
+static inline void lzom_sg_write2(struct lzom_sg_buf *buf, u16 data)
+{
+	sg_write_bytes(buf, (const unsigned char *)&data, sizeof(data));
 }
 
 static inline u32 lzom_sg_read4(struct lzom_sg_buf *buf)
@@ -92,5 +106,18 @@ static inline int lzom_sg_copy(struct lzom_sg_buf *dst, struct lzom_sg_buf *src,
 
 	return 0;
 }
+
+/* ======== decompression support (LZO1X match/zero-run handling) ======== */
+
+int sg_write_zeros(struct lzom_sg_buf *buf, size_t len);
+
+int lzom_sg_count_zero_run(struct lzom_sg_buf *in, size_t max_count,
+			   size_t *count);
+
+int lzom_sg_match_copy(struct lzom_sg_buf *out, size_t distance, size_t t);
+
+void lzom_sg_finish(struct lzom_sg_buf *in, struct bvec_iter in_start,
+		    struct lzom_sg_buf *out, struct bvec_iter out_start,
+		    size_t out_cap);
 
 #endif /* LZOM_SG_HELPERS_H */

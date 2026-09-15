@@ -230,7 +230,6 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
 
 	int bsize = original_bio->bi_iter.bi_size;
 	int ret, lzo_ret;
-	size_t decomp_len;
 	void *wrkmem;
 
 	src = lzom_sg_buf_create(original_bio->bi_iter,
@@ -260,10 +259,29 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
 		goto err_out;
 	}
 
-	decomp_len = decomp->buf_sz;
-	lzo_ret = lzom_decompress_safe(dst_data_ptr, dst.iter.bi_size,
-				       (unsigned char *)decomp->data,
-				       &decomp_len);
+	
+	size_t decomp_vec_cnt = DIV_ROUND_UP(decomp->buf_sz, PAGE_SIZE) + 1;
+	struct bio_vec *decomp_bvec;
+	struct lzom_sg_buf decomp_sg;
+
+	BUG_ON(decomp_vec_cnt > BIO_MAX_VECS);
+
+	decomp_bvec = kzalloc(decomp_vec_cnt * sizeof(*decomp_bvec),
+					GFP_NOIO);
+	if (!decomp_bvec) {
+		LZOM_ERRLOG("failed to alloc decomp bvec array");
+		ret = BLK_STS_RESOURCE;
+		goto err_out;
+	}
+
+	lzom_init_bvec_array(decomp_bvec, decomp_vec_cnt, decomp->data,
+					decomp->buf_sz);
+	decomp_sg = lzom_sg_buf_create(
+		(struct bvec_iter){ .bi_size = decomp->buf_sz },
+		decomp_bvec);
+
+	lzo_ret = lzom_decompress_safe(&dst, &decomp_sg);
+	kfree(decomp_bvec);
 
 	if (lzo_ret != LZOM_E_OK) {
 		LZOM_ERRLOG("lzom decompress failed: %d", lzo_ret);
@@ -271,7 +289,7 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
 		goto err_out;
 	}
 
-	decomp->data_sz = decomp_len;
+	decomp->data_sz = decomp_sg.iter.bi_size;
 
 	LZOM_LOG("Decompression verified successfully");
 
