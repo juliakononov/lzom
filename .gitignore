@@ -56,3 +56,9 @@ dkms.conf
 
 # Fio utility artefacts
 *.state
+
+# Experiment datasets (public corpora, re-fetchable — see experiment/README.md).
+# The experiment/dataset/<corpus> folders themselves are tracked as empty
+# placeholders (via .gitkeep); only their downloaded contents are ignored.
+experiment/dataset/*/*
+!experiment/dataset/*/.gitkeep
