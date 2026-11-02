@@ -438,6 +438,8 @@ LZO_SAFE(lzogeneric1x_1_compress)(struct lzom_sg_buf *in,
 		m4_max_offset = M4_MAX_OFFSET_V0;
 	}
 
+	struct bvec_iter data_start_iter = out->iter;
+
 	while (l > 20) {
 		size_t ll = min_t(size_t, l, m4_max_offset + 1);
 		uintptr_t ll_end = (uintptr_t)(in_len - l) + ll;
@@ -469,7 +471,7 @@ LZO_SAFE(lzogeneric1x_1_compress)(struct lzom_sg_buf *in,
 		in->iter = in_iter;
 		sg_skip_bytes(in, in_len - t);
 
-		if (out_iter.bi_size == out->iter.bi_size && t <= 238) {
+		if (data_start_iter.bi_size == out->iter.bi_size && t <= 238) {
 			lzom_sg_write1(out, 17 + t);
 		} else if (t <= 3) {
 			unsigned char prev_byte =

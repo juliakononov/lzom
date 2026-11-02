@@ -223,6 +223,7 @@ int lzom_sg_match_copy(struct lzom_sg_buf *out, size_t distance, size_t t)
 {
 	struct bvec_iter src_iter = out->iter;
 	struct lzom_sg_buf src;
+	struct bio_vec src_bv, dst_bv;
 
 	if (unlikely(lzom_sg_move_back(out, &src_iter, distance) < 0))
 		return LZO_E_LOOKBEHIND_OVERRUN;
@@ -231,6 +232,20 @@ int lzom_sg_match_copy(struct lzom_sg_buf *out, size_t distance, size_t t)
 		return LZO_E_OUTPUT_OVERRUN;
 
 	src = lzom_sg_buf_create(src_iter, out->bvec);
+
+	src_bv = bvec_iter_bvec(src.bvec, src.iter);
+	dst_bv = bvec_iter_bvec(out->bvec, out->iter);
+	if (likely(distance >= t && src_bv.bv_len >= t && dst_bv.bv_len >= t)) {
+		void *s = bvec_kmap_local(&src_bv);
+		void *d = bvec_kmap_local(&dst_bv);
+
+		memmove(d, s, t);
+		kunmap_local(d);
+		kunmap_local(s);
+		bvec_iter_advance(src.bvec, &src.iter, t);
+		bvec_iter_advance(out->bvec, &out->iter, t);
+		return LZO_E_OK;
+	}
 
 	if (distance >= 8) {
 		while (t >= 8) {

@@ -11,6 +11,12 @@
 #include "lzom_module.h"
 
 #include "lzom_extend.h"
+#include "lzom_stats.h"
+
+int lzorle1x_1_compress(const unsigned char *src, size_t src_len,
+			unsigned char *dst, size_t *dst_len, void *wrkmem);
+int lzo1x_decompress_safe(const unsigned char *src, size_t src_len,
+			  unsigned char *dst, size_t *dst_len);
 
 #define LZOM_NAME "lzom_module"
 #define LZOM_INIT_MINOR 0
@@ -97,7 +103,6 @@ static int lzom_add_buf_to_bio(struct lzom_buffer *buf, u32 part_to_use,
 	int ret;
 
 	if (buf->buf_sz < part_to_use) {
-		// TODO: LZOM_ERRLOG("");
 		return -EINVAL;
 	}
 
@@ -185,36 +190,196 @@ static void lzom_init_bvec_array(struct bio_vec *bvec, size_t vec_cnt,
 	}
 }
 
-static struct lzom_sg_buf lzom_sg_buf_create_with_buf(size_t len,
-						      char **data_ptr)
+struct lzom_rt_stats {
+	u64 copy_ns, comp_ns, decomp_ns, comp_bytes, mem;
+};
+
+/*
+ * Each of these compresses `bio`'s data with one backend, then immediately
+ * decompresses the result into the already-allocated flat buffer `out`
+ * (bsize bytes). Returns 0 and fills `st` on success. The caller writes
+ * `out` (the verified, decompressed -- i.e. original -- bytes) through to
+ * the underlying device; nothing compressed ever reaches storage here, this
+ * is a benchmarking proxy, not a real compressed block device.
+ */
+
+/* lzom_compress()/lzom_decompress_safe() straight across bio's own pages. */
+static int lzom_rt_lzom(struct bio *bio, void *wrk, unsigned char *out,
+			size_t bsize, struct lzom_rt_stats *st)
 {
-	size_t vec_cnt = DIV_ROUND_UP(len, PAGE_SIZE) + 1;
-	size_t bvec_mem_len = sizeof(struct bio_vec) * vec_cnt;
-	char *mem, *__data_ptr;
-	struct lzom_sg_buf res;
+	size_t cap = lzo_worst_compress(bsize);
+	size_t n = DIV_ROUND_UP(cap, PAGE_SIZE), done = 0, i;
+	size_t out_vec_cnt = DIV_ROUND_UP(bsize, PAGE_SIZE) + 1;
+	struct lzom_sg_buf src, dst, decomp_sg;
+	struct bio_vec *dst_bv, *out_bv = NULL;
+	u64 t0;
+	int ret, lzo_ret;
 
-	BUG_ON(vec_cnt > BIO_MAX_VECS);
+	dst_bv = kvcalloc(n, sizeof(*dst_bv), GFP_NOIO);
+	if (!dst_bv)
+		return -ENOMEM;
 
-	mem = kzalloc(bvec_mem_len + len, GFP_NOIO);
-	BUG_ON(!mem);
+	for (; done < n; done++) {
+		struct page *page = alloc_page(GFP_NOIO);
 
-	__data_ptr = mem + bvec_mem_len;
+		if (!page) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		dst_bv[done] = (struct bio_vec){ .bv_page = page,
+						 .bv_len = PAGE_SIZE };
+	}
 
-	lzom_init_bvec_array((struct bio_vec *)mem, vec_cnt, __data_ptr, len);
+	src = lzom_sg_buf_create(bio->bi_iter, bio->bi_io_vec);
+	dst = lzom_sg_buf_create((struct bvec_iter){ .bi_size = cap }, dst_bv);
 
-	res.bvec = (struct bio_vec *)mem;
-	res.iter.bi_size = len;
+	t0 = ktime_get_ns();
+	lzo_ret = lzom_compress(&src, &dst, wrk);
+	st->comp_ns = ktime_get_ns() - t0;
+	if (lzo_ret != LZOM_E_OK) {
+		ret = -EIO;
+		goto out;
+	}
+	st->comp_bytes = dst.iter.bi_size;
+	st->mem = cap + LZO1X_1_MEM_COMPRESS;
 
-	*data_ptr = __data_ptr;
-	return res;
+	out_bv = kvcalloc(out_vec_cnt, sizeof(*out_bv), GFP_NOIO);
+	if (!out_bv) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	lzom_init_bvec_array(out_bv, out_vec_cnt, out, bsize);
+	decomp_sg = lzom_sg_buf_create((struct bvec_iter){ .bi_size = bsize },
+				       out_bv);
+
+	t0 = ktime_get_ns();
+	lzo_ret = lzom_decompress_safe(&dst, &decomp_sg);
+	st->decomp_ns = ktime_get_ns() - t0;
+	ret = lzo_ret == LZOM_E_OK ? 0 : -EIO;
+out:
+	kvfree(out_bv);
+	for (i = 0; i < done; i++)
+		__free_page(dst_bv[i].bv_page);
+	kvfree(dst_bv);
+	return ret;
 }
 
-static void lzom_sg_buf_destroy_with_buf(struct lzom_sg_buf buf)
+/* Copy the whole bio into one flat buffer, then the kernel's compressor. */
+static int lzom_rt_cont(struct bio *bio, void *wrk, unsigned char *out,
+			size_t bsize, struct lzom_rt_stats *st)
 {
-	if (buf.bvec)
-		kfree(buf.bvec);
+	size_t cap = lzo_worst_compress(bsize), out_len = 0, decomp_len = bsize;
+	unsigned char *lin, *dst, *p;
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	u64 t0;
+	int ret = -ENOMEM;
 
-	memset(&buf.iter, 0, sizeof(buf.iter));
+	lin = kvmalloc(bsize, GFP_NOIO);
+	dst = kvmalloc(cap, GFP_NOIO);
+	if (!lin || !dst)
+		goto out;
+
+	t0 = ktime_get_ns();
+	p = lin;
+	bio_for_each_segment (bv, bio, iter) {
+		memcpy_from_bvec(p, &bv);
+		p += bv.bv_len;
+	}
+	st->copy_ns = ktime_get_ns() - t0;
+
+	t0 = ktime_get_ns();
+	ret = lzorle1x_1_compress(lin, bsize, dst, &out_len, wrk);
+	st->comp_ns = ktime_get_ns() - t0;
+	if (ret) {
+		ret = -EIO;
+		goto out;
+	}
+	st->comp_bytes = out_len;
+	st->mem = bsize + cap + LZO1X_1_MEM_COMPRESS;
+
+	t0 = ktime_get_ns();
+	ret = lzo1x_decompress_safe(dst, out_len, out, &decomp_len);
+	st->decomp_ns = ktime_get_ns() - t0;
+	ret = ret ? -EIO : 0;
+out:
+	kvfree(lin);
+	kvfree(dst);
+	return ret;
+}
+
+/* Kernel compressor on every segment on its own: no copy, no shared history. */
+static int lzom_rt_vect(struct bio *bio, void *wrk, unsigned char *out,
+			size_t bsize, struct lzom_rt_stats *st)
+{
+	unsigned int nsegs = bio_segments(bio), i = 0;
+	unsigned char **dst;
+	size_t *dst_len;
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	u64 t0;
+	int ret = 0;
+
+	dst = kcalloc(nsegs, sizeof(*dst), GFP_NOIO);
+	dst_len = kcalloc(nsegs, sizeof(*dst_len), GFP_NOIO);
+	if (!dst || !dst_len) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	bio_for_each_segment (bv, bio, iter) {
+		size_t cap = lzo_worst_compress(bv.bv_len);
+
+		dst[i] = kmalloc(cap, GFP_NOIO);
+		if (!dst[i]) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		st->mem += cap;
+		i++;
+	}
+	st->mem += LZO1X_1_MEM_COMPRESS;
+
+	i = 0;
+	t0 = ktime_get_ns();
+	bio_for_each_segment (bv, bio, iter) {
+		unsigned char *p = bvec_kmap_local(&bv);
+		size_t out_len = 0;
+
+		ret = lzorle1x_1_compress(p, bv.bv_len, dst[i], &out_len, wrk);
+		kunmap_local(p);
+		dst_len[i] = out_len;
+		st->comp_bytes += out_len;
+		i++;
+		if (ret)
+			break;
+	}
+	st->comp_ns = ktime_get_ns() - t0;
+	if (ret) {
+		ret = -EIO;
+		goto out;
+	}
+
+	i = 0;
+	t0 = ktime_get_ns();
+	bio_for_each_segment (bv, bio, iter) {
+		size_t seg_len = bv.bv_len;
+
+		ret = lzo1x_decompress_safe(dst[i], dst_len[i], out, &seg_len);
+		out += seg_len;
+		i++;
+		if (ret)
+			break;
+	}
+	st->decomp_ns = ktime_get_ns() - t0;
+	ret = ret ? -EIO : 0;
+out:
+	if (dst)
+		for (i = 0; i < nsegs; i++)
+			kfree(dst[i]);
+	kfree(dst);
+	kfree(dst_len);
+	return ret;
 }
 
 static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
@@ -222,96 +387,59 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
 					  struct lzom_dev *ldev)
 {
 	struct block_device *bdev = ldev->under_dev.bdev;
-	struct bio *new_bio;
-	struct lzom_sg_buf src;
-	struct lzom_sg_buf dst;
+	struct bio *new_bio = NULL;
 	struct lzom_buffer *decomp;
-	char *dst_data_ptr;
+	struct lzom_rt_stats st = {};
+	size_t bsize = original_bio->bi_iter.bi_size;
+	u64 t0 = ktime_get_ns();
+	void *wrk;
+	int ret;
 
-	int bsize = original_bio->bi_iter.bi_size;
-	int ret, lzo_ret;
-	void *wrkmem;
-
-	src = lzom_sg_buf_create(original_bio->bi_iter,
-				 original_bio->bi_io_vec);
-	dst = lzom_sg_buf_create_with_buf(lzo_worst_compress(bsize),
-					  &dst_data_ptr);
-
-	wrkmem = kzalloc(LZO1X_1_MEM_COMPRESS, GFP_NOIO);
-	if (!wrkmem) {
-		LZOM_ERRLOG("failed to alloc wrkmem");
-		ret = BLK_STS_RESOURCE;
-		goto err_out;
-	}
-
-	lzo_ret = lzom_compress(&src, &dst, wrkmem);
-
-	if (lzo_ret != LZOM_E_OK) {
-		LZOM_ERRLOG("lzom compress failed: %d", lzo_ret);
-		ret = BLK_STS_IOERR;
-		goto err_out;
-	}
+	wrk = kzalloc(LZO1X_1_MEM_COMPRESS, GFP_NOIO);
+	if (!wrk)
+		return BLK_STS_RESOURCE;
 
 	decomp = lzom_buffer_alloc(bsize);
 	if (!decomp) {
-		LZOM_ERRLOG("failed to alloc decomp buffer");
-		ret = BLK_STS_RESOURCE;
-		goto err_out;
+		kfree(wrk);
+		return BLK_STS_RESOURCE;
 	}
 
-	
-	size_t decomp_vec_cnt = DIV_ROUND_UP(decomp->buf_sz, PAGE_SIZE) + 1;
-	struct bio_vec *decomp_bvec;
-	struct lzom_sg_buf decomp_sg;
-
-	BUG_ON(decomp_vec_cnt > BIO_MAX_VECS);
-
-	decomp_bvec = kzalloc(decomp_vec_cnt * sizeof(*decomp_bvec),
-					GFP_NOIO);
-	if (!decomp_bvec) {
-		LZOM_ERRLOG("failed to alloc decomp bvec array");
-		ret = BLK_STS_RESOURCE;
-		goto err_out;
+	switch (lzom_comp_type) {
+	case LZOM_COMP_CONT:
+		ret = lzom_rt_cont(original_bio, wrk, decomp->data, bsize, &st);
+		break;
+	case LZOM_COMP_VECT:
+		ret = lzom_rt_vect(original_bio, wrk, decomp->data, bsize, &st);
+		break;
+	default:
+		ret = lzom_rt_lzom(original_bio, wrk, decomp->data, bsize, &st);
 	}
+	kfree(wrk);
 
-	lzom_init_bvec_array(decomp_bvec, decomp_vec_cnt, decomp->data,
-					decomp->buf_sz);
-	decomp_sg = lzom_sg_buf_create(
-		(struct bvec_iter){ .bi_size = decomp->buf_sz },
-		decomp_bvec);
-
-	lzo_ret = lzom_decompress_safe(&dst, &decomp_sg);
-	kfree(decomp_bvec);
-
-	if (lzo_ret != LZOM_E_OK) {
-		LZOM_ERRLOG("lzom decompress failed: %d", lzo_ret);
-		ret = BLK_STS_IOERR;
-		goto err_out;
+	if (ret) {
+		LZOM_ERRLOG("round-trip failed: %d", ret);
+		lzom_buffer_free(decomp);
+		return ret == -ENOMEM ? BLK_STS_RESOURCE : BLK_STS_IOERR;
 	}
-
-	decomp->data_sz = decomp_sg.iter.bi_size;
-
-	LZOM_LOG("Decompression verified successfully");
-
-	lreq->buffer = decomp;
-
-	lzom_sg_buf_destroy_with_buf(dst);
-	kfree(wrkmem);
-	wrkmem = NULL;
+	decomp->data_sz = bsize;
 
 	new_bio = bio_alloc(bdev, lzom_bio_size_to_pages(bsize),
 			    original_bio->bi_opf, GFP_NOIO);
 	if (!new_bio) {
 		LZOM_ERRLOG("failed to alloc new bio");
-		ret = BLK_STS_RESOURCE;
-		goto err_out;
+		lzom_buffer_free(decomp);
+		return BLK_STS_RESOURCE;
 	}
 
+	lreq->buffer = decomp;
 	ret = lzom_add_buf_to_bio(lreq->buffer, bsize, new_bio);
 	if (ret != 0) {
 		LZOM_ERRLOG("failed to add buffer to bio");
-		ret = BLK_STS_IOERR;
-		goto err_out;
+		bio_put(new_bio);
+		lzom_buffer_free(decomp);
+		lreq->buffer = NULL;
+		return BLK_STS_IOERR;
 	}
 
 	new_bio->bi_end_io = lzom_write_req_endio;
@@ -321,29 +449,23 @@ static blk_status_t lzom_write_req_submit(struct lzom_req *lreq,
 	lreq->original_bio = original_bio;
 	lreq->new_bio = new_bio;
 
+	LZOM_STAT_ADD(w_reqs, 1);
+	LZOM_STAT_ADD(w_bytes, bsize);
+	LZOM_STAT_ADD(w_comp_bytes, st.comp_bytes);
+	LZOM_STAT_ADD(w_vecs, bio_segments(original_bio));
+	LZOM_STAT_ADD(w_copy_ns, st.copy_ns);
+	LZOM_STAT_ADD(w_comp_ns, st.comp_ns);
+	LZOM_STAT_ADD(w_decomp_ns, st.decomp_ns);
+	LZOM_STAT_ADD(w_mem, st.mem);
+
 	submit_bio_noacct(new_bio);
+	LZOM_STAT_ADD(w_total_ns, ktime_get_ns() - t0);
 	return BLK_STS_OK;
-
-err_out:
-	lzom_sg_buf_destroy_with_buf(dst);
-
-	if (decomp)
-		lzom_buffer_free(decomp);
-
-	if (lreq->buffer) {
-		lzom_buffer_free(lreq->buffer);
-		lreq->buffer = NULL;
-	}
-	if (new_bio)
-		bio_put(new_bio);
-	if (wrkmem)
-		kfree(wrkmem);
-	return ret;
 }
 
-static blk_status_t lzom_read_req_submit(struct lzom_req *lreq,
-					 struct bio *original_bio,
-					 struct lzom_dev *ldev)
+static blk_status_t lzom_passthrough_submit(struct lzom_req *lreq,
+					    struct bio *original_bio,
+					    struct lzom_dev *ldev)
 {
 	struct block_device *bdev = ldev->under_dev.bdev;
 	struct bio_set *bset = ldev->under_dev.bset;
@@ -372,6 +494,7 @@ static void lzom_submit_bio(struct bio *original_bio)
 	struct lzom_dev *ldev = original_bio->bi_bdev->bd_disk->private_data;
 	struct lzom_req *lreq;
 	enum req_op op_type = bio_op(original_bio);
+	u64 t0;
 
 	if (!ldev || !ldev->under_dev.bdev) {
 		LZOM_ERRLOG("invalid device context");
@@ -391,9 +514,14 @@ static void lzom_submit_bio(struct bio *original_bio)
 		goto submit_bio_with_err_free_req;
 
 	case REQ_OP_READ:
-		if (lzom_read_req_submit(lreq, original_bio, ldev) ==
-		    BLK_STS_OK)
+		t0 = ktime_get_ns();
+		if (lzom_passthrough_submit(lreq, original_bio, ldev) ==
+		    BLK_STS_OK) {
+			LZOM_STAT_ADD(r_reqs, 1);
+			LZOM_STAT_ADD(r_bytes, original_bio->bi_iter.bi_size);
+			LZOM_STAT_ADD(r_total_ns, ktime_get_ns() - t0);
 			return;
+		}
 		goto submit_bio_with_err_free_req;
 
 	default:

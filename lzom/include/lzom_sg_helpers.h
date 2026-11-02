@@ -29,52 +29,84 @@ u64 lzom_sg_read8_at(struct lzom_sg_buf *buf, struct bvec_iter start,
 
 /* ========== simple inline wrappers ========== */
 
+static inline void lzom_sg_read_fast(struct lzom_sg_buf *buf, void *data,
+				     size_t n)
+{
+	struct bio_vec bv = bvec_iter_bvec(buf->bvec, buf->iter);
+
+	if (likely(bv.bv_len >= n)) {
+		memcpy_from_page((char *)data, bv.bv_page, bv.bv_offset, n);
+		bvec_iter_advance(buf->bvec, &buf->iter, n);
+		return;
+	}
+
+	sg_read_bytes(buf, data, n);
+}
+
+static inline void lzom_sg_write_fast(struct lzom_sg_buf *buf, const void *data,
+				      size_t n)
+{
+	struct bio_vec bv = bvec_iter_bvec(buf->bvec, buf->iter);
+
+	if (likely(bv.bv_len >= n)) {
+		memcpy_to_page(bv.bv_page, bv.bv_offset, (const char *)data, n);
+		bvec_iter_advance(buf->bvec, &buf->iter, n);
+		return;
+	}
+
+	sg_write_bytes(buf, data, n);
+}
+
 static inline unsigned char lzom_sg_read1(struct lzom_sg_buf *buf)
 {
 	unsigned char data;
-	sg_read_bytes(buf, &data, sizeof(data));
+
+	lzom_sg_read_fast(buf, &data, sizeof(data));
 	return data;
 }
 
 static inline void lzom_sg_write1(struct lzom_sg_buf *buf, unsigned char data)
 {
-	sg_write_bytes(buf, &data, sizeof(data));
+	lzom_sg_write_fast(buf, &data, sizeof(data));
 }
 
 static inline u16 lzom_sg_read2(struct lzom_sg_buf *buf)
 {
 	u16 data;
-	sg_read_bytes(buf, (unsigned char *)&data, sizeof(data));
+
+	lzom_sg_read_fast(buf, &data, sizeof(data));
 	return data;
 }
 
 static inline void lzom_sg_write2(struct lzom_sg_buf *buf, u16 data)
 {
-	sg_write_bytes(buf, (const unsigned char *)&data, sizeof(data));
+	lzom_sg_write_fast(buf, &data, sizeof(data));
 }
 
 static inline u32 lzom_sg_read4(struct lzom_sg_buf *buf)
 {
 	u32 data;
-	sg_read_bytes(buf, (unsigned char *)&data, sizeof(data));
+
+	lzom_sg_read_fast(buf, &data, sizeof(data));
 	return data;
 }
 
 static inline void lzom_sg_write4(struct lzom_sg_buf *buf, u32 data)
 {
-	sg_write_bytes(buf, (const unsigned char *)&data, sizeof(data));
+	lzom_sg_write_fast(buf, &data, sizeof(data));
 }
 
 static inline u64 lzom_sg_read8(struct lzom_sg_buf *buf)
 {
 	u64 data;
-	sg_read_bytes(buf, (unsigned char *)&data, sizeof(data));
+
+	lzom_sg_read_fast(buf, &data, sizeof(data));
 	return data;
 }
 
 static inline void lzom_sg_write8(struct lzom_sg_buf *buf, u64 data)
 {
-	sg_write_bytes(buf, (const unsigned char *)&data, sizeof(data));
+	lzom_sg_write_fast(buf, &data, sizeof(data));
 }
 
 static inline void lzom_sg_copy1(struct lzom_sg_buf *dst,
