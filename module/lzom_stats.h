@@ -6,19 +6,19 @@
 #include <linux/moduleparam.h>
 #include <linux/string.h>
 
-#define LZOM_STAT_LIST(S) \
-	S(w_reqs)       /* how many write reqs submitted */ \
-	S(w_bytes)      /* size of uncompressed data */     \
+#define LZOM_STAT_LIST(S)                                   \
+	S(w_reqs)	/* how many write reqs submitted */ \
+	S(w_bytes)	/* size of uncompressed data */     \
 	S(w_comp_bytes) /* size of compressed data */       \
-	S(w_vecs)       /* number of segments */            \
-	S(w_copy_ns)    /* time for data copying */         \
-	S(w_comp_ns)    /* time for compression */          \
-	S(w_decomp_ns)  /* time for decompression */        \
-	S(w_total_ns)   /* total elapsed time */            \
-	S(w_mem)        /* memory usage in bytes */         \
-	S(r_reqs)       /* how many read reqs submitted */  \
-	S(r_bytes)      /* size of data read */             \
-	S(r_total_ns)   /* total elapsed time */
+	S(w_vecs)	/* number of segments */            \
+	S(w_copy_ns)	/* time for data copying */         \
+	S(w_comp_ns)	/* time for compression */          \
+	S(w_decomp_ns)	/* time for decompression */        \
+	S(w_total_ns)	/* total elapsed time */            \
+	S(w_mem)	/* memory usage in bytes */         \
+	S(r_reqs)	/* how many read reqs submitted */  \
+	S(r_bytes)	/* size of data read */             \
+	S(r_total_ns)	/* total elapsed time */
 
 #define LZOM_STAT_DEF(n) static atomic64_t lzom_stat_##n = ATOMIC64_INIT(0);
 LZOM_STAT_LIST(LZOM_STAT_DEF)
